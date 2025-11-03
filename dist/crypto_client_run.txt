@@ -1,0 +1,6 @@
+cd ~/Desktop 
+chmod +x app
+xattr -dr com.apple.quarantine app
+
+export E2E_WS_BASE=ws://10.2.47.170:5088
+./app
