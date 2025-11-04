@@ -150,6 +150,16 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 await send_json(writer, {"type": "PONG"})
                 continue
 
+            if t == "ONLINE":
+                online = [name for name, state in USERS.items()
+                          if state.writer is not None and not state.writer.is_closing()]
+                try:
+                    online.remove(username)
+                except ValueError:
+                    pass
+                await send_json(writer, {"type": "ONLINE_LIST", "users": online})
+                continue
+
             if t == "PUBKEY_REQUEST":
                 target = msg.get("user")
                 resp_user = USERS.get(target)

@@ -112,9 +112,14 @@ class Storage:
           rsa_pub_pem   BLOB NOT NULL,
           fingerprint   TEXT NOT NULL,
           verified      INTEGER NOT NULL DEFAULT 0,
-          added_at      INTEGER NOT NULL
+          added_at      INTEGER NOT NULL,
+          remote_username TEXT
         );
         """)
+        try:
+            cur.execute("ALTER TABLE contacts ADD COLUMN remote_username TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         # Sessions (one per contact)
         cur.execute("""
@@ -252,18 +257,32 @@ class Storage:
         
     # ---------- Contacts ----------
     
-    def contact_add(self, name: str, rsa_pub_pem: bytes, fingerprint: str, verified: bool = False):
+    def contact_add(
+        self,
+        name: str,
+        rsa_pub_pem: bytes,
+        fingerprint: str,
+        verified: bool = False,
+        remote_username: Optional[str] = None,
+    ):
         self.conn.execute("""
-            INSERT OR REPLACE INTO contacts(name, rsa_pub_pem, fingerprint, verified, added_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (name, rsa_pub_pem, fingerprint, 1 if verified else 0, _now_ts()))
+            INSERT OR REPLACE INTO contacts(name, rsa_pub_pem, fingerprint, verified, added_at, remote_username)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name, rsa_pub_pem, fingerprint, 1 if verified else 0, _now_ts(), remote_username))
         self.conn.commit()
 
     def contact_get(self, name: str) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM contacts WHERE name=?", (name,)).fetchone()
 
+    def contact_get_by_remote(self, remote_username: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM contacts WHERE remote_username=?", (remote_username,)).fetchone()
+
     def contact_verify(self, name: str, verified: bool = True):
         self.conn.execute("UPDATE contacts SET verified=? WHERE name=?", (1 if verified else 0, name))
+        self.conn.commit()
+
+    def contact_update_alias(self, old_name: str, new_name: str):
+        self.conn.execute("UPDATE contacts SET name=? WHERE name=?", (new_name, old_name))
         self.conn.commit()
         
     # ---------- Sessions (bundles encrypted with DEK) ----------

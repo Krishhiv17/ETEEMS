@@ -80,6 +80,7 @@ class Transport:
         self._pub_pem = private_to_public_pem(self._priv)
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
+        self._online_future: Optional[asyncio.Future] = None
 
     async def connect(self):
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
@@ -132,6 +133,15 @@ class Transport:
     async def request_pubkey(self, user: str):
         await self._send_json({"type": "PUBKEY_REQUEST", "user": user})
 
+    async def request_online(self) -> list[str]:
+        if self._online_future and not self._online_future.done():
+            raise RuntimeError("An /online request is already in flight")
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._online_future = fut
+        await self._send_json({"type": "ONLINE"})
+        return await fut
+
     async def run_receive_loop(
         self,
         on_frame: Callable[[str, int, bytes], Awaitable[None]],
@@ -159,3 +169,7 @@ class Transport:
             elif t in {"PUBKEY_RESPONSE", "PUBKEY_ERROR"}:
                 if on_pubkey:
                     await on_pubkey(msg)
+            elif t == "ONLINE_LIST":
+                if self._online_future and not self._online_future.done():
+                    self._online_future.set_result(msg.get("users", []))
+                self._online_future = None
