@@ -1,7 +1,7 @@
 # client/app.py
 import asyncio, os, sys, json, base64, random, time, getpass, pathlib, re
+from collections import deque
 from typing import Optional, Tuple, Dict, Callable, Awaitable
-import sys
 from client.config import WS_BASE  # e.g., "ws://127.0.0.1:5088"
 from client.transport import Transport
 from client.storage import Storage
@@ -82,13 +82,19 @@ def load_or_create_identity(priv_path: str, pub_path: str) -> Tuple[bytes, bytes
 
 # ---------- DB helpers (use Storage.conn directly to avoid API mismatch) ----------
 
-def db_upsert_contact(s: Storage, name: str, pub_pem: Optional[bytes]) -> None:
+def db_upsert_contact(
+    s: Storage,
+    alias: str,
+    pub_pem: Optional[bytes],
+    remote_username: Optional[str] = None,
+    verified: bool = False,
+) -> None:
     if pub_pem is None:
         raise ValueError("pub_pem is required; contacts.fingerprint is NOT NULL")
 
     # Compute SHA-256 fingerprint of the SubjectPublicKeyInfo (DER)
     fp_hex = compute_pubkey_fingerprint(pub_pem).hex()
-    s.contact_add(name, pub_pem, fp_hex, verified=False)
+    s.contact_add(alias, pub_pem, fp_hex, verified=verified, remote_username=remote_username)
 
 
 
@@ -97,6 +103,14 @@ def db_get_contact_pub(s: Storage, name: str) -> Optional[bytes]:
     if not row:
         return None
     return row["rsa_pub_pem"] if row["rsa_pub_pem"] else None
+
+def db_get_contact_row(s: Storage, name: str) -> Optional[dict]:
+    row = s.contact_get(name)
+    return dict(row) if row else None
+
+def db_get_contact_by_remote(s: Storage, remote_username: str) -> Optional[dict]:
+    row = s.contact_get_by_remote(remote_username)
+    return dict(row) if row else None
 
 def db_get_session(s: Storage, contact: str) -> Optional[dict]:
     sess = s.session_get(contact)
@@ -202,13 +216,16 @@ class ClientRuntime:
         self.transport: Optional[Transport] = None
         self.priv_pem: Optional[bytes] = None
         self.pub_pem: Optional[bytes]  = None
-        # ephemeral DH for initiator
-        self._dh_priv: Optional[int] = None
-        self._dh_pub:  Optional[int] = None
         self._pending_pubkeys: dict[str, asyncio.Future] = {}
         self._prompt_clear: Optional[Callable[[], Awaitable[None]]] = None
         self._prompt_render: Optional[Callable[[], Awaitable[None]]] = None
         self._prompt_visible: bool = False
+        self._pending_prompts: deque[dict] = deque()
+        self._active_prompt: Optional[dict] = None
+        self._pending_friend_outgoing: Dict[str, str] = {}
+        self._pending_chat_outgoing: Dict[str, str] = {}
+        self.active_contact: Optional[str] = None
+        self._dh_pending: Dict[str, tuple[int, int, str]] = {}
 
     async def start(self):
         # DB & vault
@@ -236,7 +253,7 @@ class ClientRuntime:
         self.priv_pem, self.pub_pem = load_or_create_identity(self._priv_pem_path, self._pub_pem_path)
 
         # upsert our own contact record (optional, for convenience)
-        db_upsert_contact(self.storage, self.username, self.pub_pem)
+        db_upsert_contact(self.storage, self.username, self.pub_pem, remote_username=self.username, verified=True)
 
         # connect transport
         self.transport = Transport(WS_BASE, self.username, self.priv_pem, privkey_pass=None)
@@ -247,105 +264,127 @@ class ClientRuntime:
 
     # ----- session bootstrap (initiator) -----
 
-    async def start_session_with(self, peer: str, force: bool = False):
-        sess = db_get_session(self.storage, peer)
+    async def start_session_with(self, alias: str, remote_username: str, force: bool = False):
+        sess = db_get_session(self.storage, alias)
         if sess and not force:
-            # quietly reuse existing session
+            print(f"[session] already active with {alias} (sid={sess['session_id']})")
             return
 
-        # generate ephemeral DH and session id
         a, A = dh_gen()
         sid = random.randint(1, 0xFFFF)
-        self._dh_priv, self._dh_pub = a, A
+        self._dh_pending[remote_username] = (a, A, alias)
 
         payload = build_init_payload(sid, A, self.username)
-        await self.transport.send_session(peer, payload)
-        print(f"[session:init] sent to {peer}: sid={sid}, A=({A.bit_length()} bits)")
+        await self.transport.send_session(remote_username, payload)
+        print(f"[session:init] sent to {alias}: sid={sid}, A=({A.bit_length()} bits)")
 
     # ----- send message -----
 
-    async def send_text(self, peer: str, text: str):
-        sess = db_get_session(self.storage, peer)
+    async def send_text(self, alias: str, text: str):
+        row = self.storage.contact_get(alias)
+        if not row:
+            print(f"[send] unknown contact '{alias}'.")
+            return
+        remote_username = row["remote_username"] or alias
+        sess = db_get_session(self.storage, alias)
         if not sess:
-            await self.start_session_with(peer)
-            # wait briefly for session establishment
+            await self.start_session_with(alias, remote_username)
             for _ in range(50):
                 await asyncio.sleep(0.1)
-                sess = db_get_session(self.storage, peer)
+                sess = db_get_session(self.storage, alias)
                 if sess:
                     break
             if not sess:
-                print(f"[send] waiting for secure session with {peer}; try again shortly")
+                print(f"[send] waiting for secure session with {alias}; try again shortly")
                 return
         seq = int(sess["seq_send"])
         keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
         sid = int(sess["session_id"])
         pt = text.encode("utf-8")
         frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
-        await self.transport.send_frame(peer, sid, frame)
-        db_store_message(self.storage, peer, "out", sid, seq, pt)
-        db_bump_seq_send(self.storage, peer, seq + 1)
+        await self.transport.send_frame(remote_username, sid, frame)
+        db_store_message(self.storage, alias, "out", sid, seq, pt)
+        db_bump_seq_send(self.storage, alias, seq + 1)
         print(f"You: {text}")
 
     # ----- receive hooks from Transport -----
 
     async def _on_session(self, from_user: str, payload: bytes):
-        # ensure contact record exists; fetch from relay if needed
-        if not self.storage.contact_get(from_user):
-            try:
-                pem = await self.fetch_remote_pubkey(from_user)
-                db_upsert_contact(self.storage, from_user, pem)
-                print(f"[contacts] auto-imported {from_user}")
-            except Exception as exc:
-                print(f"[session] missing contact {from_user}: {exc}")
-                return
-
         try:
             obj = parse_session_payload(payload)
         except Exception:
             print(f"[session] bad payload from {from_user}")
             return
 
-        t = obj.get("t"); sid = int(obj.get("sid", 0)); me = obj.get("me", "?")
+        t = obj.get("t")
+        if t == "friend_req":
+            await self._handle_friend_request(from_user, obj)
+            return
+        if t == "friend_resp":
+            await self._handle_friend_response(from_user, obj)
+            return
+        if t == "chat_req":
+            await self._handle_chat_request(from_user, obj)
+            return
+        if t == "chat_resp":
+            await self._handle_chat_response(from_user, obj)
+            return
+
+        sid = int(obj.get("sid", 0))
         dh_b = b64d(obj.get("dh_b64", ""))
         peer_pub = bytes_to_int(dh_b)
 
-        # two branches: we are responder (got INIT) or initiator (got RESP)
         if t == "init":
-            # responder flow: we generate our ephemeral, compute shared, derive keys, store session, send RESP
+            alias = self._alias_for_remote(from_user)
+            if alias is None:
+                alias = from_user
+                try:
+                    pem = await self.fetch_remote_pubkey(from_user)
+                except Exception as exc:
+                    print(f"[session] failed to fetch key for {from_user}: {exc}")
+                    return
+                db_upsert_contact(self.storage, alias, pem, remote_username=from_user, verified=False)
+
             b, B = dh_gen()
             s_int = dh_shared(b, peer_pub)
             s_bytes = int_to_bytes(s_int)
-            AtoB, BtoA = derive_keys(s_bytes, from_user, self.username)  # direction is peer->me & me->peer
-            # store session: peer name key
+            AtoB, BtoA = derive_keys(s_bytes, from_user, self.username)
             db_put_session(
-                self.storage, from_user, sid,
-                Kenc_ab=BtoA["K_enc"], Kmac_ab=BtoA["K_mac"], IVseed_ab=BtoA["IVseed"],  # self -> peer
-                Kenc_ba=AtoB["K_enc"], Kmac_ba=AtoB["K_mac"], IVseed_ba=AtoB["IVseed"],  # peer -> self
-                seq_send=0, seq_recv_next=0
+                self.storage,
+                alias,
+                sid,
+                Kenc_ab=BtoA["K_enc"], Kmac_ab=BtoA["K_mac"], IVseed_ab=BtoA["IVseed"],
+                Kenc_ba=AtoB["K_enc"], Kmac_ba=AtoB["K_mac"], IVseed_ba=AtoB["IVseed"],
+                seq_send=0,
+                seq_recv_next=0,
             )
-            # send RESP (our B)
             resp = build_resp_payload(sid, B, self.username)
             await self.transport.send_session(from_user, resp)
-            print(f"[session:resp] to={from_user} sid={sid}, derived keys; sent B ({B.bit_length()} bits)")
+            if not self.active_contact:
+                self.active_contact = alias
+            print(f"[session:resp] to={alias} sid={sid}, derived keys; sent B ({B.bit_length()} bits)")
             return
 
         if t == "resp":
-            # initiator flow: compute shared using our ephemeral 'a'
-            if self._dh_priv is None:
+            pending = self._dh_pending.pop(from_user, None)
+            if not pending:
                 print("[session] got RESP but no pending INIT; ignoring")
                 return
-            s_int = dh_shared(self._dh_priv, peer_pub)
+            a, _A, alias = pending
+            s_int = dh_shared(a, peer_pub)
             s_bytes = int_to_bytes(s_int)
             AtoB, BtoA = derive_keys(s_bytes, self.username, from_user)
             db_put_session(
-                self.storage, from_user, sid,
+                self.storage,
+                alias,
+                sid,
                 Kenc_ab=AtoB["K_enc"], Kmac_ab=AtoB["K_mac"], IVseed_ab=AtoB["IVseed"],
                 Kenc_ba=BtoA["K_enc"], Kmac_ba=BtoA["K_mac"], IVseed_ba=BtoA["IVseed"],
-                seq_send=0, seq_recv_next=0
+                seq_send=0,
+                seq_recv_next=0,
             )
-            self._dh_priv = None; self._dh_pub = None
-            print(f"[session:init→ready] with {from_user} sid={sid}, keys installed")
+            self.active_contact = alias
+            print(f"[session:init→ready] with {alias} sid={sid}, keys installed")
             return
 
         print(f"[session] unknown type from {from_user}: {t}")
@@ -360,7 +399,8 @@ class ClientRuntime:
             except Exception:
                 restore_prompt = False
 
-        sess = db_get_session(self.storage, from_user)
+        alias = self._alias_for_remote(from_user) or from_user
+        sess = db_get_session(self.storage, alias)
         if not sess or int(sess["session_id"]) != int(session_id):
             print(f"[recv] unknown session from={from_user} sid={session_id}")
             return
@@ -383,8 +423,8 @@ class ClientRuntime:
             return
 
         # accept
-        db_store_message(self.storage, from_user, "in", session_id, seq, pt)
-        db_set_seq_recv_next(self.storage, from_user, seq + 1)
+        db_store_message(self.storage, alias, "in", session_id, seq, pt)
+        db_set_seq_recv_next(self.storage, alias, seq + 1)
         try:
             print(f"{from_user}: {pt.decode('utf-8', errors='replace')}")
         except Exception:
@@ -434,16 +474,302 @@ class ClientRuntime:
         self._prompt_render = render_cb
         self._prompt_visible = False
 
+    def _remote_for_alias(self, alias: str) -> Optional[str]:
+        row = self.storage.contact_get(alias)
+        if row:
+            remote = row["remote_username"]
+            return remote or alias
+        return None
+
+    def _alias_for_remote(self, remote_username: str) -> Optional[str]:
+        row = self.storage.contact_get_by_remote(remote_username)
+        if row:
+            return row["name"]
+        return None
+
+    async def _ensure_contact_alias(
+        self,
+        alias: str,
+        remote_username: str,
+        verified: bool,
+        pem: Optional[bytes] = None,
+    ) -> None:
+        row = self.storage.contact_get(alias)
+        if row:
+            if verified and not row["verified"]:
+                self.storage.contact_verify(alias, True)
+            return
+        if pem is None:
+            pem = await self.fetch_remote_pubkey(remote_username)
+        db_upsert_contact(
+            self.storage,
+            alias,
+            pem,
+            remote_username=remote_username,
+            verified=verified,
+        )
+
+    async def _send_control(self, remote_username: str, obj: dict) -> None:
+        payload = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        await self.transport.send_session(remote_username, payload)
+
+    async def _handle_friend_request(self, from_user: str, obj: dict) -> None:
+        existing_row = self.storage.contact_get_by_remote(from_user)
+        existing = dict(existing_row) if existing_row else None
+        if existing and existing["verified"]:
+            await self._send_control(
+                from_user,
+                {
+                    "t": "friend_resp",
+                    "status": "accept",
+                    "alias": existing["name"],
+                    "pem": self.pub_pem.decode("utf-8"),
+                },
+            )
+            return
+        pem_b64 = obj.get("pem_b64")
+        if pem_b64:
+            pem = base64.b64decode(pem_b64.encode("ascii"))
+        else:
+            try:
+                pem = await self.fetch_remote_pubkey(from_user)
+            except Exception as exc:
+                print(f"[friend] failed to fetch key for {from_user}: {exc}")
+                await self._send_control(from_user, {"t": "friend_resp", "status": "error"})
+                return
+        prompt = {
+            "type": "friend_confirm",
+            "remote": from_user,
+            "pem": pem,
+        }
+        self._pending_prompts.append(prompt)
+        await self._maybe_show_prompt()
+
+    async def _handle_friend_response(self, from_user: str, obj: dict) -> None:
+        status = obj.get("status")
+        alias = self._pending_friend_outgoing.pop(from_user, obj.get("alias") or from_user)
+        if status != "accept":
+            print(f"[friend] {from_user} rejected your request.")
+            return
+        pem_field = obj.get("pem_b64")
+        if pem_field:
+            pem = base64.b64decode(pem_field.encode("ascii"))
+        else:
+            print(f"[friend] peer response missing key material; fetching from relay...")
+            try:
+                pem = await self.fetch_remote_pubkey(from_user)
+            except Exception as exc:
+                print(f"[friend] could not fetch key for {from_user}: {exc}")
+                return
+        await self._ensure_contact_alias(alias, from_user, True, pem=pem)
+        self.storage.contact_verify(alias, True)
+        print(f"[friend] {from_user} accepted. Saved as {alias}.")
+
+    async def _handle_chat_request(self, from_user: str, obj: dict) -> None:
+        row_obj = self.storage.contact_get_by_remote(from_user)
+        row = dict(row_obj) if row_obj else None
+        if not row or not row.get("verified"):
+            await self._send_control(from_user, {"t": "chat_resp", "status": "reject"})
+            print(f"[chat] Ignored chat request from {from_user}; not in friends list.")
+            return
+        alias = row["name"]
+        prompt = {
+            "type": "chat_confirm",
+            "remote": from_user,
+            "alias": alias,
+        }
+        self._pending_prompts.append(prompt)
+        await self._maybe_show_prompt()
+
+    async def _handle_chat_response(self, from_user: str, obj: dict) -> None:
+        alias = self._pending_chat_outgoing.pop(from_user, None)
+        status = obj.get("status")
+        if status != "accept":
+            print(f"[chat] {from_user} declined your chat request.")
+            return
+        if alias is None:
+            alias = self._alias_for_remote(from_user) or from_user
+        print(f"[chat] {from_user} accepted. Establishing secure session...")
+        await self.start_session_with(alias, from_user, force=True)
+        self.active_contact = alias
+
+
+    async def _accept_friend(self, remote_username: str, alias: str, pem: bytes) -> None:
+        await self._ensure_contact_alias(alias, remote_username, True, pem=pem)
+        self.storage.contact_verify(alias, True)
+        print(f"[friend] Added {alias}.")
+
+    async def _maybe_show_prompt(self) -> None:
+        if self._active_prompt or not self._pending_prompts:
+            return
+        prompt = self._pending_prompts.popleft()
+        self._active_prompt = prompt
+        p_type = prompt["type"]
+        if p_type == "friend_confirm":
+            print(f"[friend] {prompt['remote']} wants to connect. Accept? (Y/n): ", end="", flush=True)
+        elif p_type == "friend_alias":
+            default_alias = prompt.get("default_alias", prompt["remote"])
+            prompt["default_alias"] = default_alias
+            print(f"[friend] Enter a name to display for {prompt['remote']} (default: {default_alias}): ", end="", flush=True)
+        elif p_type == "chat_confirm":
+            print(f"[chat] {prompt['alias']} wants to start a chat. Accept? (Y/n): ", end="", flush=True)
+
+    async def handle_prompt_input(self, line: str) -> bool:
+        if not self._active_prompt:
+            return False
+        prompt = self._active_prompt
+        self._active_prompt = None
+        p_type = prompt["type"]
+        response = line.strip().lower()
+        if p_type == "friend_confirm":
+            accepted = response in ("", "y", "yes")
+            if accepted:
+                alias_prompt = {
+                    "type": "friend_alias",
+                    "remote": prompt["remote"],
+                    "pem": prompt["pem"],
+                    "default_alias": prompt["remote"],
+                }
+                self._active_prompt = alias_prompt
+                print(f"[friend] Enter a name to display for {prompt['remote']} (default: {prompt['remote']}): ", end="", flush=True)
+            else:
+                await self._send_control(prompt["remote"], {"t": "friend_resp", "status": "reject"})
+                print(f"[friend] Rejected request from {prompt['remote']}.")
+                await self._maybe_show_prompt()
+            return True
+        if p_type == "friend_alias":
+            alias = line.strip() or prompt.get("default_alias", prompt["remote"])
+            await self._accept_friend(prompt["remote"], alias, prompt["pem"])
+            await self._send_control(
+                prompt["remote"],
+                {
+                    "t": "friend_resp",
+                    "status": "accept",
+                    "alias": alias,
+                    "pem_b64": base64.b64encode(self.pub_pem).decode("ascii"),
+                },
+            )
+            await self._maybe_show_prompt()
+            return True
+        if p_type == "chat_confirm":
+            accepted = response in ("", "y", "yes")
+            if accepted:
+                self.active_contact = prompt["alias"]
+                await self._handle_chat_response_local(prompt["remote"], True)
+                print(f"[chat] Accepted chat with {prompt['alias']}.")
+            else:
+                await self._handle_chat_response_local(prompt["remote"], False)
+                print(f"[chat] Declined chat with {prompt['alias']}.")
+            await self._maybe_show_prompt()
+            return True
+        return False
+
+    async def _handle_chat_response_local(self, from_user: str, accepted: bool) -> None:
+        status = "accept" if accepted else "reject"
+        await self._send_control(from_user, {"t": "chat_resp", "status": status})
+
+    async def show_online(self) -> None:
+        if not self.transport:
+            print("[online] transport not ready yet.")
+            return
+        try:
+            users = await self.transport.request_online()
+        except Exception as exc:
+            print(f"[online] error: {exc}")
+            return
+        if not users:
+            print("[online] no other users connected.")
+        else:
+            print("[online] " + ", ".join(users))
+
+    async def send_friend_request(self, alias: str, remote_username: str) -> None:
+        alias = alias.strip()
+        if not alias:
+            print("[friend] alias required.")
+            return
+        remote_username = remote_username.strip()
+        if not remote_username:
+            print("[friend] remote username required.")
+            return
+        if remote_username == self.username:
+            print("[friend] cannot add yourself.")
+            return
+        existing_alias_row = self.storage.contact_get(alias)
+        if existing_alias_row:
+            remote_bound = existing_alias_row["remote_username"]
+            if remote_bound not in (None, remote_username):
+                print(f"[friend] alias '{alias}' is already used for another contact.")
+                return
+        existing_alias = dict(existing_alias_row) if existing_alias_row else None
+        if existing_alias and existing_alias.get("remote_username") not in (None, remote_username):
+            print(f"[friend] alias '{alias}' is already used for another contact.")
+            return
+        existing_row = self.storage.contact_get_by_remote(remote_username)
+        existing = dict(existing_row) if existing_row else None
+        if existing and existing.get("verified"):
+            print(f"[friend] already connected with {existing['name']}.")
+            return
+        if remote_username in self._pending_friend_outgoing:
+            print(f"[friend] request to {remote_username} already pending.")
+            return
+        self._pending_friend_outgoing[remote_username] = alias
+        await self._send_control(
+            remote_username,
+            {
+                "t": "friend_req",
+                "pem_b64": base64.b64encode(self.pub_pem).decode("ascii"),
+            },
+        )
+        print(f"[friend] request sent to {remote_username}. Waiting for response...")
+
+    async def send_chat_request(self, alias: str) -> None:
+        alias = alias.strip()
+        if not alias:
+            print("[chat] usage: /chat <alias>")
+            return
+        row_obj = self.storage.contact_get(alias)
+        row = dict(row_obj) if row_obj else None
+        if not row or not row.get("verified"):
+            print(f"[chat] '{alias}' is not an accepted friend yet.")
+            return
+        remote_username = row.get("remote_username") or alias
+        sess = db_get_session(self.storage, alias)
+        if sess:
+            self.active_contact = alias
+            print(f"[chat] Session already active with {alias}.")
+            return
+        self._pending_chat_outgoing[remote_username] = alias
+        await self._send_control(remote_username, {"t": "chat_req"})
+        print(f"[chat] request sent to {alias}. Awaiting approval...")
+
+    async def rekey_active(self) -> None:
+        if not self.active_contact:
+            print("[chat] no active chat to rekey.")
+            return
+        remote_username = self._remote_for_alias(self.active_contact)
+        if not remote_username:
+            print("[chat] missing remote mapping for active contact.")
+            return
+        await self.start_session_with(self.active_contact, remote_username, force=True)
+        print(f"[rekey] started new session with {self.active_contact}.")
+
+    async def handle_plain_message(self, text: str) -> None:
+        if not self.active_contact:
+            print("[chat] no active chat. Use /chat <alias> to start one.")
+            return
+        await self.send_text(self.active_contact, text)
+
 # ---------- CLI ----------
 
 HELP = """
-Type your message and press Enter to send to the active contact.
 Commands:
-  /rekey                         Force a fresh DH/HKDF with the active contact
-  /add <name> <src|@peer>        Import or update a contact key
-  /chat <name>                   Switch active contact
-  /help                          Show this help text
+  /online                        List currently connected users
+  /add <alias> @<user>           Send a friend request to <user>
+  /chat <alias>                  Request a secure chat with a friend
+  /rekey                         Force a key rotation with the active chat
+  /help                          Show this help
   /quit                          Exit the client
+Type a message to send it to the active chat.
 """
 
 async def cli_main():
@@ -454,43 +780,12 @@ async def cli_main():
     client = ClientRuntime(username, pw)
     await client.start()
 
-    async def ensure_contact(contact_name: str) -> str:
-        try:
-            row = client.storage.contact_get(contact_name)
-            if row:
-                return contact_name
-            pem = await client.fetch_remote_pubkey(contact_name)
-            db_upsert_contact(client.storage, contact_name, pem)
-            print(f"[contacts] auto-imported {contact_name}")
-            return contact_name
-        except Exception as exc:
-            raise RuntimeError(f"could not load contact '{contact_name}': {exc}")
-
     loop = asyncio.get_running_loop()
 
     # simple stdin reader
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, os.fdopen(0, "rb", buffering=0))
-
-    active_contact: Optional[str] = None
-    if sys.stdin.isatty():
-        while not active_contact:
-            try:
-                peer = input("Chat with (contact name): ").strip()
-            except EOFError:
-                break
-            if not peer:
-                continue
-            try:
-                active_contact = await ensure_contact(peer)
-            except Exception as exc:
-                print(f"[chat] {exc}")
-                continue
-            await client.start_session_with(active_contact)
-    else:
-        print("[chat] non-interactive stdin detected; type /chat <name> or /add to manage contacts.")
-
     print(HELP)
 
     async def prompt_clear():
@@ -498,91 +793,81 @@ async def cli_main():
             return
         sys.stdout.write("\r\033[K")
         sys.stdout.flush()
+        client._prompt_visible = False
+
+    async def prompt_render():
+        if not sys.stdin.isatty() or client._active_prompt:
+            return
+        label = f"{client.active_contact}> " if client.active_contact else "> "
+        sys.stdout.write(label)
+        sys.stdout.flush()
+        client._prompt_visible = True
 
     async def clear_input_echo():
         if not sys.stdin.isatty():
             return
-        # Move to previous line (where input/prompt was) and clear it
         sys.stdout.write("\033[F\r\033[K")
-        sys.stdout.flush()
-
-    async def prompt_render():
-        if not sys.stdin.isatty():
-            return
-        label = "You> " if active_contact else "> "
-        sys.stdout.write(label)
         sys.stdout.flush()
 
     client.register_prompt_hooks(prompt_clear, prompt_render)
 
+    await prompt_render()
+
     while True:
-        if sys.stdin.isatty():
-            await prompt_render()
-            client._prompt_visible = True
         raw_line = await reader.readline()
         if not raw_line:
             break
         if client._prompt_visible:
             await prompt_clear()
-            client._prompt_visible = False
-        if sys.stdin.isatty():
+        line = raw_line.decode("utf-8", errors="ignore").strip()
+        if sys.stdin.isatty() and not line.startswith("/"):
             await clear_input_echo()
-        line_full = raw_line.decode("utf-8", errors="ignore")
-        line = line_full.strip()
+        elif sys.stdin.isatty() and line.startswith("/"):
+            print()
+        if client._active_prompt:
+            await client.handle_prompt_input(line)
+            await prompt_render()
+            continue
         if not line:
+            await prompt_render()
             continue
         if line == "/quit":
             break
         if line == "/help":
             print(HELP)
+            await prompt_render()
             continue
-        if line == "/rekey":
-            await client.start_session_with(active_contact, force=True)
+        if line == "/online":
+            await client.show_online()
+            await prompt_render()
             continue
         if line.startswith("/add "):
-            try:
-                _, name, source = line.split(maxsplit=2)
-                if source.startswith("@"):
-                    target = source[1:] or name
-                    pem = await client.fetch_remote_pubkey(target)
-                else:
-                    path = os.path.expanduser(source)
-                    if not os.path.isfile(path):
-                        raise FileNotFoundError(f"{path} not found")
-                    with open(path, "rb") as f:
-                        pem = f.read()
-                db_upsert_contact(client.storage, name, pem)
-                print(f"[contacts] upserted {name}")
-            except Exception as e:
-                print(f"[contacts] error: {e}")
+            parts = line.split()
+            if len(parts) != 3 or not parts[2].startswith("@"):
+                print("usage: /add <alias> @<username>")
+                await prompt_render()
+                continue
+            alias = parts[1]
+            remote = parts[2].lstrip("@")
+            await client.send_friend_request(alias, remote)
+            await prompt_render()
             continue
         if line.startswith("/chat "):
-            _, name = line.split(maxsplit=1)
-            try:
-                active_contact = await ensure_contact(name)
-                await client.start_session_with(active_contact)
-            except Exception as exc:
-                print(f"[chat] {exc}")
+            _, alias = line.split(maxsplit=1)
+            await client.send_chat_request(alias.strip())
+            await prompt_render()
             continue
-        if line.startswith("/start "):
-            _, name = line.split(maxsplit=1)
-            await client.start_session_with(name)
-            continue
-        if line.startswith("/send "):
-            try:
-                _, name, msg = line.split(maxsplit=2)
-            except ValueError:
-                print("usage: /send <name> <message>"); continue
-            await client.send_text(name, msg)
+        if line == "/rekey":
+            await client.rekey_active()
+            await prompt_render()
             continue
         if line.startswith("/"):
             print("Unknown command. Type /help")
+            await prompt_render()
             continue
 
-        if not active_contact:
-            print("[chat] no active contact. Use /chat <name> first.")
-            continue
-        await client.send_text(active_contact, line)
+        await client.handle_plain_message(line)
+        await prompt_render()
 
     # shutdown
     try:
@@ -594,5 +879,3 @@ async def cli_main():
 
 if __name__ == "__main__":
     asyncio.run(cli_main())
-
-
