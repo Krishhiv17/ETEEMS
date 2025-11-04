@@ -10,6 +10,9 @@ from client.framing import (
     BadTag, ReplayError, OutOfOrderError, ShortFrame,
 )
 from client.crypto import hkdf_derive, dh_gen, dh_shared  # uses your Phase-2 helpers
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 # ---------- simple helpers ----------
 
@@ -38,9 +41,6 @@ def ensure_dir(path: str):
     
 def compute_pubkey_fingerprint(pub_pem: bytes) -> bytes:
     """SHA-256 over DER SubjectPublicKeyInfo of the RSA public key."""
-    from cryptography.hazmat.primitives import serialization, hashes
-    from cryptography.hazmat.primitives.serialization import load_pem_public_key
-
     pub = load_pem_public_key(pub_pem)
     der = pub.public_bytes(
         encoding=serialization.Encoding.DER,
@@ -63,8 +63,7 @@ def load_or_create_identity(priv_path: str, pub_path: str) -> Tuple[bytes, bytes
         return priv_pem, pub_pem
 
     # generate
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives import serialization
+    
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     priv_pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
