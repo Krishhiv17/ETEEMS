@@ -285,6 +285,10 @@ class Storage:
         self.conn.execute("UPDATE contacts SET name=? WHERE name=?", (new_name, old_name))
         self.conn.commit()
         
+    def contact_delete(self, name: str):
+        self.conn.execute("DELETE FROM contacts WHERE name=?", (name,))
+        self.conn.commit()
+        
     # ---------- Sessions (bundles encrypted with DEK) ----------
     
     def session_upsert(
