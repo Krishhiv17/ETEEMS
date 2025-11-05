@@ -30,4 +30,4 @@ AD_MESSAGES  = b"e2e-messages-v1"
 GCM_NONCE_LEN = 12  # 96-bit as recommended
 
 
-WS_BASE = os.environ.get("E2E_WS_BASE", "ws://127.0.0.1:5088")
+WS_BASE = os.environ.get("E2E_WS_BASE", "ws://10.2.47.170:5088")
