@@ -1,0 +1,1 @@
+([('gui_app', '/Volumes/Code-CS/Crypto-Project/dist/gui_app', 'EXECUTABLE')],)
