@@ -224,7 +224,7 @@ class ClientRuntime:
         self._pending_friend_outgoing: Dict[str, str] = {}
         self._pending_chat_outgoing: Dict[str, str] = {}
         self.active_contact: Optional[str] = None
-        self._dh_pending: Dict[str, tuple[int, int, str]] = {}
+        self._dh_pending: Dict[str, tuple[int, int, int, str]] = {}
 
     async def start(self):
         # DB & vault
@@ -271,7 +271,7 @@ class ClientRuntime:
 
         a, A = dh_gen()
         sid = random.randint(1, 0xFFFF)
-        self._dh_pending[remote_username] = (a, A, alias)
+        self._dh_pending[remote_username] = (sid, a, A, alias)
 
         payload = build_init_payload(sid, A, self.username)
         await self.transport.send_session(remote_username, payload)
@@ -334,15 +334,26 @@ class ClientRuntime:
         peer_pub = bytes_to_int(dh_b)
 
         if t == "init":
+            pending = self._dh_pending.get(from_user)
+            pending_sid = pending[0] if pending else None
+            pending_alias = pending[3] if pending else None
+
+            if pending_sid is not None and sid > pending_sid:
+                print(f"[session] ignoring inbound INIT from {from_user}; keeping sid={pending_sid}")
+                return
+
             alias = self._alias_for_remote(from_user)
             if alias is None:
-                alias = from_user
-                try:
-                    pem = await self.fetch_remote_pubkey(from_user)
-                except Exception as exc:
-                    print(f"[session] failed to fetch key for {from_user}: {exc}")
-                    return
-                db_upsert_contact(self.storage, alias, pem, remote_username=from_user, verified=False)
+                alias = pending_alias or from_user
+                if pending_alias is None:
+                    try:
+                        pem = await self.fetch_remote_pubkey(from_user)
+                    except Exception as exc:
+                        print(f"[session] failed to fetch key for {from_user}: {exc}")
+                        return
+                    db_upsert_contact(self.storage, alias, pem, remote_username=from_user, verified=False)
+            # If we also initiated a session, drop the pending state so we adopt the peer's SID.
+            self._dh_pending.pop(from_user, None)
 
             b, B = dh_gen()
             s_int = dh_shared(b, peer_pub)
@@ -369,7 +380,9 @@ class ClientRuntime:
             if not pending:
                 print("[session] got RESP but no pending INIT; ignoring")
                 return
-            a, _A, alias = pending
+            sid_local, a, _A, alias = pending
+            if sid != sid_local:
+                print(f"[session] warning: RESP sid={sid} mismatched pending sid={sid_local}; adopting RESP")
             s_int = dh_shared(a, peer_pub)
             s_bytes = int_to_bytes(s_int)
             AtoB, BtoA = derive_keys(s_bytes, self.username, from_user)
@@ -732,14 +745,16 @@ class ClientRuntime:
             print(f"[chat] '{alias}' is not an accepted friend yet.")
             return
         remote_username = row.get("remote_username") or alias
-        sess = db_get_session(self.storage, alias)
-        if sess:
-            self.active_contact = alias
-            print(f"[chat] Session already active with {alias}.")
+        if remote_username in self._pending_chat_outgoing:
+            print(f"[chat] request to {alias} already pending.")
             return
+        sess = db_get_session(self.storage, alias)
         self._pending_chat_outgoing[remote_username] = alias
         await self._send_control(remote_username, {"t": "chat_req"})
-        print(f"[chat] request sent to {alias}. Awaiting approval...")
+        if sess:
+            print(f"[chat] request sent to {alias}. Awaiting approval for new session...")
+        else:
+            print(f"[chat] request sent to {alias}. Awaiting approval...")
 
     async def rekey_active(self) -> None:
         if not self.active_contact:
