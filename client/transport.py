@@ -133,7 +133,7 @@ class Transport:
     async def request_pubkey(self, user: str):
         await self._send_json({"type": "PUBKEY_REQUEST", "user": user})
 
-    async def request_online(self) -> list[str]:
+    async def request_online(self) -> list[dict]:
         if self._online_future and not self._online_future.done():
             raise RuntimeError("An /online request is already in flight")
         loop = asyncio.get_running_loop()
