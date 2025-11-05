@@ -1,4 +1,3 @@
-# server/db.py
 import os, sqlite3, time
 from typing import Optional, List
 

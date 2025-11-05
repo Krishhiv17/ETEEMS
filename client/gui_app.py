@@ -1,4 +1,3 @@
-# client/gui_app.py
 import asyncio
 import queue
 import threading

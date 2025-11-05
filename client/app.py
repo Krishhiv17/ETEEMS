@@ -1,4 +1,3 @@
-# client/app.py
 import asyncio, os, sys, json, base64, random, time, getpass, pathlib, re
 from collections import deque
 from typing import Optional, Tuple, Dict, Callable, Awaitable, List
