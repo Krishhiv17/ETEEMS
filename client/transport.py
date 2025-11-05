@@ -1,4 +1,3 @@
-# client/transport.py
 import asyncio, base64, json, re
 from typing import Callable, Awaitable, Optional
 from client.config import WS_BASE

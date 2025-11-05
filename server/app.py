@@ -1,4 +1,3 @@
-# server/app.py
 import asyncio, json, os, base64, secrets, signal
 from typing import Optional, Dict, Any
 
