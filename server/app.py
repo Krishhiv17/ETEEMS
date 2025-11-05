@@ -1,4 +1,3 @@
-# server/app.py
 import asyncio, json, os, base64, secrets, signal
 from typing import Optional, Dict, Any
 
@@ -50,6 +49,21 @@ def _fmt_addr(addr: Optional[tuple[str, int]]) -> str:
         return "offline"
     host, port = addr
     return f"{host}:{port}"
+
+def compute_pubkey_fingerprint(pem_text: str) -> Optional[str]:
+    if not pem_text:
+        return None
+    try:
+        pub = serialization.load_pem_public_key(pem_text.encode("utf-8"))
+        der = pub.public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        h = hashes.Hash(hashes.SHA256())
+        h.update(der)
+        return h.finalize().hex()
+    except Exception:
+        return None
 
 # --------------- in-memory directory & queues ----------------
 
@@ -151,12 +165,17 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 continue
 
             if t == "ONLINE":
-                online = [name for name, state in USERS.items()
-                          if state.writer is not None and not state.writer.is_closing()]
-                try:
-                    online.remove(username)
-                except ValueError:
-                    pass
+                online = []
+                for name, state in USERS.items():
+                    if state.writer is None or state.writer.is_closing():
+                        continue
+                    if name == username:
+                        continue
+                    entry = {"user": name}
+                    fp = compute_pubkey_fingerprint(state.pub_pem_text or "")
+                    if fp:
+                        entry["fingerprint"] = fp
+                    online.append(entry)
                 await send_json(writer, {"type": "ONLINE_LIST", "users": online})
                 continue
 
