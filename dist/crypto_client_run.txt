@@ -5,7 +5,7 @@ Steps to run the GUI client (macOS, Apple Silicon):
    cd ~/Desktop
    unzip -o gui_app-macos.zip
    xattr -dr com.apple.quarantine gui_app.app
-   export E2E_WS_BASE=tcp://10.2.52.219:5088
+   export E2E_WS_BASE=ws://10.2.52.219:5088
    open gui_app.app
 
 3. In the window that appears, enter your username and a passphrase (this creates your keys). Click Connect.
