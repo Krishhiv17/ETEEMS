@@ -8,9 +8,6 @@ Steps to run the GUI client (macOS, Apple Silicon):
    export E2E_WS_BASE=ws://10.2.52.219:5088
    open gui_app.app
 
-3. In the window that appears, enter your username and a passphrase (this creates your keys). Click Connect.
-4. Make sure you are on the same network as the server and keep Terminal open while the app is running.
-
 View your local database (contacts, sessions, messages)
 - Ask for the file: dump_client_db (binary) and place it next to crypto_client_run.txt (e.g., Desktop).
 - In Terminal:
