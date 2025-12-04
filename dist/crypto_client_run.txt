@@ -10,3 +10,12 @@ Steps to run the GUI client (macOS, Apple Silicon):
 
 3. In the window that appears, enter your username and a passphrase (this creates your keys). Click Connect.
 4. Make sure you are on the same network as the server and keep Terminal open while the app is running.
+
+View your local database (contacts, sessions, messages)
+- Ask for the file: dump_client_db (binary) and place it next to crypto_client_run.txt (e.g., Desktop).
+- In Terminal:
+    cd ~/Desktop
+    chmod +x dump_client_db
+    xattr -dr com.apple.quarantine dump_client_db
+    ./dump_client_db
+  It will prompt for your username (or use --db to point at a specific ~/.e2e/<user>/client.db) and passphrase if you choose decrypted view.
