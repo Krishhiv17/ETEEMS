@@ -10,7 +10,7 @@ This document outlines the detailed plan for implementing 5 major enhancements t
 
 ---
 
-## Phase 1: Login/New Account Screen (GUI)
+## Phase 1: Login/New Account Screen (GUI) ✅ Done
 
 ### Objective
 Add a proper authentication flow to the GUI application with separate screens for account creation and login.
@@ -98,128 +98,34 @@ Add a proper authentication flow to the GUI application with separate screens fo
 
 ---
 
-## Phase 2: Device Limitation System (Server-side)
+## Phase 2: Device Limitation System (Server-side) ✅ Done
 
 ### Objective
 Enforce that each user can only connect from 2 registered MAC addresses. Server tracks and validates device connections.
 
-### Current State
-- Server (`server/app.py`) tracks users in-memory only (`USERS` dict)
-- No persistent device tracking
-- No MAC address extraction or validation
-- Server database (`server/db.py`) has basic user table but no device tracking
+### Current State (after implementation)
+- Server (`server/app.py`) now persists users/devices and enforces a 2-device limit during HELLO.
+- Device tracking stored in `server.db` (`devices` table) with `is_active`, timestamps.
+- Client sends MAC in HELLO (override via `E2E_MAC` for testing); server validates/normalizes.
 
-### Changes Required
+### Changes Implemented
 
-#### 2.1 MAC Address Extraction
-**File: `server/app.py`**
+#### 2.1 MAC Address Extraction (implemented)
+- Client reports MAC in HELLO; server normalizes/validates (colon-separated uppercase).
+- Client helper `get_local_mac_address()` with `E2E_MAC` override for testing.
 
-- **Add `get_mac_address(peer_addr: tuple) -> Optional[str]`**:
-  - Extract MAC address from connection
-  - **Challenge**: TCP connections don't directly expose MAC addresses
-  - **Solution**: Request MAC address from client in HELLO message
-  - Client sends MAC address in HELLO payload
-  - Server validates format (12 hex chars or XX:XX:XX:XX:XX:XX format)
-  - Store normalized format (uppercase, colons)
+#### 2.2 Server Database Schema Updates (implemented)
+- Added `devices` table (username, mac_address, registered_at, last_seen, is_active, UNIQUE(username, mac_address)).
+- Added DB helpers: `register_device`, `is_device_allowed`, `update_device_last_seen`, `deactivate_device`, `get_user_devices`.
 
-- **Alternative Approach** (if MAC spoofing is acceptable):
-  - Use client-reported MAC address (trusted)
-  - Client extracts MAC using platform-specific methods:
-    - Linux: `/sys/class/net/*/address` or `ip link`
-    - macOS: `ifconfig` or `networksetup`
-    - Windows: `getmac` or WMI
-  - Client includes MAC in HELLO message
+#### 2.3 Server Connection Handler Updates (implemented)
+- HELLO now requires MAC; normalizes and enforces the 2-device limit via DB before HELLO_OK.
+- Sends `DEVICE_LIMIT_EXCEEDED` error and closes if limit hit; tracks MAC in `UserState`.
 
-#### 2.2 Server Database Schema Updates
-**File: `server/db.py`**
+#### 2.4 Client Transport Updates (implemented)
+- Client includes MAC in HELLO; accepts `E2E_MAC` override; raises clear error on `DEVICE_LIMIT_EXCEEDED`.
 
-- **Add `devices` table**:
-```sql
-CREATE TABLE IF NOT EXISTS devices (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  username      TEXT NOT NULL,
-  mac_address   TEXT NOT NULL,
-  registered_at INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL,
-  is_active     INTEGER NOT NULL DEFAULT 1,
-  FOREIGN KEY(username) REFERENCES users(name) ON DELETE CASCADE,
-  UNIQUE(username, mac_address)
-);
-
-CREATE INDEX IF NOT EXISTS idx_devices_username ON devices(username);
-CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac_address);
-```
-
-- **Add methods to `ServerDB` class**:
-  - `register_device(username: str, mac_address: str) -> bool`
-    - Returns True if device registered, False if limit exceeded
-    - Check count of active devices for user
-    - If < 2, add new device
-    - If == 2, return False (or allow replacement of oldest inactive device)
-  
-  - `get_user_devices(username: str) -> List[dict]`
-    - Return all devices for user
-  
-  - `is_device_allowed(username: str, mac_address: str) -> bool`
-    - Check if MAC address is registered for user
-  
-  - `update_device_last_seen(username: str, mac_address: str) -> None`
-    - Update last_seen timestamp
-  
-  - `deactivate_device(username: str, mac_address: str) -> None`
-    - Mark device as inactive (for replacement)
-
-#### 2.3 Server Connection Handler Updates
-**File: `server/app.py`**
-
-- **Modify `handle_conn()` function**:
-  - Extract MAC address from HELLO message
-  - After signature verification, check device:
-    - If new MAC: call `db.register_device(username, mac_address)`
-      - If registration fails (limit exceeded): send `DEVICE_LIMIT_EXCEEDED` error and close connection
-    - If existing MAC: call `db.update_device_last_seen(username, mac_address)`
-  - Store MAC address in `UserState` object
-  - Add device validation before processing any messages
-
-- **Add device limit error handling**:
-  - New error type: `{"type": "ERR", "reason": "DEVICE_LIMIT_EXCEEDED", "message": "Maximum 2 devices allowed"}`
-  - Client should display user-friendly error
-
-#### 2.4 Client Transport Updates
-**File: `client/transport.py`**
-
-- **Add MAC address extraction utility**:
-  - `get_local_mac_address() -> str`
-  - Platform-specific implementation:
-    - Linux: Read from `/sys/class/net/eth0/address` or first active interface
-    - macOS: Use `ifconfig` or `networksetup -listallhardwareports`
-    - Windows: Use `uuid.getnode()` or WMI query
-  - Return normalized format (uppercase with colons)
-
-- **Modify `Transport.connect()`**:
-  - Extract MAC address before sending HELLO
-  - Include `mac_address` field in HELLO message:
-    ```python
-    hello = {
-        "type": "HELLO",
-        "user": self.username,
-        "sig_b64": b64e(sig),
-        "rsa_pub_pem": self._pub_pem.decode("utf-8"),
-        "mac_address": get_local_mac_address(),  # NEW
-    }
-    ```
-
-- **Handle device limit error**:
-  - Catch `DEVICE_LIMIT_EXCEEDED` error in connection flow
-  - Raise user-friendly exception for GUI to display
-
-#### 2.5 Device Management UI (Optional Enhancement)
-**File: `client/gui_app.py`**
-
-- Add "Manage Devices" section in settings
-- Show list of registered devices
-- Allow user to remove old devices (requires server API endpoint)
-- Show last seen timestamps
+#### 2.5 Device Management UI (optional, not implemented)
 
 ### Security Considerations
 
@@ -952,4 +858,3 @@ This plan provides a comprehensive roadmap for implementing all 5 enhancements. 
 2. Set up development branches for each phase
 3. Begin implementation with Phase 1
 4. Regular code reviews and testing throughout
-

@@ -284,6 +284,10 @@ class ClientGUI:
         self._show_login_screen()
         self.root.after(200, self._drain_events)
 
+    def _is_device_limit_error(self, msg: str) -> bool:
+        m = msg.lower()
+        return "device limit" in m or "maximum 2 devices" in m
+
     def _show_login_screen(self) -> None:
         """Show the initial login screen."""
         if self._current_window:
@@ -521,6 +525,13 @@ class ClientGUI:
             return
         except RuntimeError as exc:
             error_msg = str(exc)
+            if self._is_device_limit_error(error_msg):
+                self.status_var.set("Device limit exceeded.")
+                messagebox.showerror("Device limit exceeded", error_msg or "Maximum devices reached for this account.")
+                self.client = None
+                self._account_creation_in_progress = False
+                self.root.after(0, self.on_close)
+                return
             # Check if this is an account creation error (should stay on create screen)
             if "already exists" in error_msg.lower() or "does not exist" in error_msg.lower():
                 self.status_var.set("Account error.")

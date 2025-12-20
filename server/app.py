@@ -1,11 +1,22 @@
-import asyncio, json, os, base64, secrets, signal
+import asyncio, json, os, base64, secrets, signal, re, sys
 from typing import Optional, Dict, Any
+
+# Allow running as script (python server/app.py) or as module (python -m server.app)
+try:
+    from server.db import ServerDB  # type: ignore
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(__file__))
+    from db import ServerDB  # type: ignore
 
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
 HOST = os.environ.get("E2E_HOST", "0.0.0.0")
 PORT = int(os.environ.get("E2E_PORT", "5088"))
+DB_PATH = os.environ.get("E2E_DB_PATH", "./server/server.db")
+MAX_ACTIVE_DEVICES = 2
+
+DB = ServerDB(DB_PATH)
 
 # --------------- helpers ----------------
 
@@ -65,6 +76,14 @@ def compute_pubkey_fingerprint(pem_text: str) -> Optional[str]:
     except Exception:
         return None
 
+def normalize_mac(mac: str) -> Optional[str]:
+    if not mac:
+        return None
+    s = mac.strip().upper().replace("-", "").replace(":", "")
+    if not re.fullmatch(r"[0-9A-F]{12}", s):
+        return None
+    return ":".join(s[i:i+2] for i in range(0, 12, 2))
+
 # --------------- in-memory directory & queues ----------------
 
 class UserState:
@@ -76,6 +95,7 @@ class UserState:
         self.inbox_sessions: list[dict[str, Any]] = []   # queued SESSION payloads
         self.pub_pem_text: Optional[str] = None
         self.peer_addr: Optional[tuple[str, int]] = None
+        self.mac_address: Optional[str] = None
 
 USERS: Dict[str, UserState] = {}  # username -> state
 
@@ -105,8 +125,14 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         username = hello.get("user")
         sig_b64 = hello.get("sig_b64")
         pub_pem = hello.get("rsa_pub_pem")
-        if not username or not sig_b64 or not pub_pem:
+        mac_in = hello.get("mac_address")
+        if not username or not sig_b64 or not pub_pem or mac_in is None:
             await send_json(writer, {"type": "ERR", "reason": "HELLO fields missing"})
+            writer.close(); await writer.wait_closed(); return
+
+        mac_norm = normalize_mac(mac_in)
+        if not mac_norm:
+            await send_json(writer, {"type": "ERR", "reason": "INVALID_MAC"})
             writer.close(); await writer.wait_closed(); return
 
         try:
@@ -121,12 +147,27 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             await send_json(writer, {"type": "ERR", "reason": "signature verify failed"})
             writer.close(); await writer.wait_closed(); return
 
+        # Persist user + device; enforce device limit
+        try:
+            DB.register_or_update_user(username, pub_pem.encode("utf-8"))
+            allowed = DB.register_device(username, mac_norm)
+        except Exception:
+            allowed = False
+        if not allowed:
+            await send_json(writer, {
+                "type": "ERR",
+                "reason": "DEVICE_LIMIT_EXCEEDED",
+                "message": f"Maximum {MAX_ACTIVE_DEVICES} devices allowed per user.",
+            })
+            writer.close(); await writer.wait_closed(); return
+
         # Register / update user state
         u = get_or_create_user(username)
         u.writer = writer
         u.pubkey = pub
         u.pub_pem_text = pub_pem
         u.peer_addr = writer.get_extra_info("peername")
+        u.mac_address = mac_norm
 
         print(f"[relay] HELLO from {username}@{_fmt_addr(u.peer_addr)}")
 

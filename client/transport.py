@@ -1,4 +1,4 @@
-import asyncio, base64, json, re
+import asyncio, base64, json, re, uuid, os
 from typing import Callable, Awaitable, Optional
 from client.config import WS_BASE
 
@@ -24,6 +24,21 @@ def sign_pss_sha256(priv, message: bytes) -> bytes:
         padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
         hashes.SHA256()
     )
+
+def get_local_mac_address() -> str:
+    """
+    Best-effort MAC detection using uuid.getnode().
+    Returns uppercase colon-separated MAC; falls back to pseudo if unavailable.
+    """
+    env_mac = os.environ.get("E2E_MAC")
+    if env_mac:
+        s = env_mac.strip().upper().replace("-", "").replace(":", "")
+        if re.fullmatch(r"[0-9A-F]{12}", s):
+            return ":".join(s[i:i+2] for i in range(0, 12, 2))
+    mac = uuid.getnode()
+    mac &= (1 << 48) - 1
+    mac_hex = f"{mac:012X}"
+    return ":".join(mac_hex[i:i+2] for i in range(0, 12, 2))
 
 def _parse_host_port(url: str) -> tuple[str, int]:
     """
@@ -80,6 +95,7 @@ class Transport:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self._online_future: Optional[asyncio.Future] = None
+        self.mac_address: str = get_local_mac_address()
 
     async def connect(self):
         try:
@@ -111,12 +127,17 @@ class Transport:
             "user": self.username,
             "sig_b64": b64e(sig),
             "rsa_pub_pem": self._pub_pem.decode("utf-8"),
+            "mac_address": self.mac_address,
         }
         await _write_json(self.writer, hello)
 
         ok = await _read_json(self.reader)
         if ok.get("type") != "HELLO_OK":
-            raise RuntimeError(f"handshake failed: {ok}")
+            reason = ok.get("reason") or "unknown"
+            message = ok.get("message") or ""
+            if reason == "DEVICE_LIMIT_EXCEEDED":
+                raise RuntimeError(message or "Device limit exceeded for this account.")
+            raise RuntimeError(f"handshake failed: {reason}")
         return True
 
     async def close(self):
