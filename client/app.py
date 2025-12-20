@@ -226,27 +226,122 @@ class ClientRuntime:
         self._dh_pending: Dict[str, tuple[int, int, int, str]] = {}
         self._event_listeners: List[Callable[[dict], None]] = []
 
-    async def start(self):
+    @staticmethod
+    def check_account_exists(username: str) -> bool:
+        """
+        Check if an account (vault database) exists for the given username.
+        Returns True if the account database file exists AND has an initialized vault, False otherwise.
+        An empty database file (created by Storage.__init__) does not count as an existing account.
+        """
+        import sqlite3
+        data_dir = _user_data_dir(username)
+        db_path = os.path.join(data_dir, "client.db")
+        
+        if not os.path.exists(db_path):
+            return False
+        
+        # Check if the vault table exists and has been initialized
+        # An empty database file doesn't count as an existing account
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            # Check if vault table exists and has data
+            cursor.execute("""
+                SELECT COUNT(*) FROM sqlite_master 
+                WHERE type='table' AND name='vault'
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            if not table_exists:
+                conn.close()
+                return False
+            
+            # Check if vault has been initialized (has kek_salt and dek_wrapped)
+            cursor.execute("""
+                SELECT kek_salt, dek_wrapped FROM vault WHERE id=1
+            """)
+            row = cursor.fetchone()
+            conn.close()
+            
+            # Account exists if vault table has data (kek_salt and dek_wrapped are not empty)
+            if row and row[0] and row[1]:
+                return True
+            return False
+        except Exception:
+            # If we can't read the database, assume it doesn't exist
+            return False
+
+    async def start(self, is_new_account: Optional[bool] = None):
+        """
+        Start the client runtime.
+        
+        Args:
+            is_new_account: If True, expects to create a new account (will error if exists).
+                          If False, expects to login to existing account (will error if doesn't exist).
+                          If None (default), auto-detects: tries login first, creates if vault missing.
+                          This preserves backward compatibility for CLI usage.
+        """
+        # Check account existence BEFORE initializing storage (which creates the DB file)
+        if is_new_account is True:
+            # Check if account already exists BEFORE creating storage/database
+            if ClientRuntime.check_account_exists(self.username):
+                raise RuntimeError(
+                    f"Account '{self.username}' already exists. Please login instead."
+                )
+        
         # DB & vault
         self.storage.init_schema()
-        try:
-            self.storage.login(self.passphrase)
-        except ValueError as e:
-            self.storage.logout()
-            raise SystemExit(
-                "[vault] Invalid passphrase for existing vault. Use the original passphrase "
-                f"or remove {self._db_path} to reset."
-            ) from e
-        except RuntimeError:
-            # first time setup
-            self.storage.first_time_setup(self.passphrase)
-            self.storage.logout()
-            self.storage = Storage(db_path=self._db_path)
-            self.storage.init_schema()
-            self.storage.login(self.passphrase)
-        except Exception:
-            self.storage.logout()
-            raise
+        
+        if is_new_account is True:
+            # New account: create vault (explicit create mode)
+            try:
+                self.storage.first_time_setup(self.passphrase)
+                self.storage.logout()
+                # Recreate storage instance after setup
+                self.storage = Storage(db_path=self._db_path)
+                self.storage.init_schema()
+                self.storage.login(self.passphrase)
+            except Exception as e:
+                self.storage.logout()
+                raise
+        elif is_new_account is False:
+            # Existing account: login (explicit login mode)
+            try:
+                self.storage.login(self.passphrase)
+            except ValueError as e:
+                self.storage.logout()
+                raise SystemExit(
+                    "[vault] Invalid passphrase for existing vault. Use the original passphrase "
+                    f"or remove {self._db_path} to reset."
+                ) from e
+            except RuntimeError as e:
+                self.storage.logout()
+                raise RuntimeError(
+                    f"Account '{self.username}' does not exist. Please create a new account."
+                ) from e
+            except Exception:
+                self.storage.logout()
+                raise
+        else:
+            # Auto mode: try login, create if vault missing (backward compatible)
+            try:
+                self.storage.login(self.passphrase)
+            except ValueError as e:
+                self.storage.logout()
+                raise SystemExit(
+                    "[vault] Invalid passphrase for existing vault. Use the original passphrase "
+                    f"or remove {self._db_path} to reset."
+                ) from e
+            except RuntimeError:
+                # first time setup - automatically create account
+                self.storage.first_time_setup(self.passphrase)
+                self.storage.logout()
+                self.storage = Storage(db_path=self._db_path)
+                self.storage.init_schema()
+                self.storage.login(self.passphrase)
+            except Exception:
+                self.storage.logout()
+                raise
 
         # identity keys (PEM files under ~/.e2e/keys)
         self.priv_pem, self.pub_pem = load_or_create_identity(self._priv_pem_path, self._pub_pem_path)

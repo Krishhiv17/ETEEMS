@@ -82,7 +82,20 @@ class Transport:
         self._online_future: Optional[asyncio.Future] = None
 
     async def connect(self):
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        try:
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Timed out connecting to server at {self.host}:{self.port}. "
+                "Ensure the server is running locally or update E2E_WS_BASE."
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to connect to server at {self.host}:{self.port}: {exc}"
+            ) from exc
 
         # 1) Receive HELLO_CHALLENGE
         msg = await _read_json(self.reader)

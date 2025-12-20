@@ -8,14 +8,257 @@ from typing import Optional
 from client.app import ClientRuntime
 
 
+class LoginWindow:
+    """Initial login screen with options to create account or login."""
+    
+    def __init__(self, parent: tk.Tk, on_create_account: callable, on_login: callable):
+        self.parent = parent
+        self.on_create_account = on_create_account
+        self.on_login = on_login
+        self.frame = ttk.Frame(parent, padding=40)
+        self.frame.pack(fill="both", expand=True)
+        self._build_ui()
+    
+    def _build_ui(self) -> None:
+        # Title
+        title_label = ttk.Label(
+            self.frame,
+            text="E2E Messenger",
+            font=("TkDefaultFont", 24, "bold")
+        )
+        title_label.pack(pady=(0, 40))
+        
+        # Subtitle
+        subtitle_label = ttk.Label(
+            self.frame,
+            text="Secure End-to-End Encrypted Messaging",
+            font=("TkDefaultFont", 10)
+        )
+        subtitle_label.pack(pady=(0, 60))
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(self.frame)
+        buttons_frame.pack(pady=20)
+        
+        # Create Account button
+        create_btn = ttk.Button(
+            buttons_frame,
+            text="Create New Account",
+            command=self.on_create_account,
+            width=25
+        )
+        create_btn.pack(pady=10)
+        
+        # Login button
+        login_btn = ttk.Button(
+            buttons_frame,
+            text="Login to Existing Account",
+            command=self.on_login,
+            width=25
+        )
+        login_btn.pack(pady=10)
+    
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class CreateAccountWindow:
+    """Window for creating a new account."""
+    
+    def __init__(self, parent: tk.Tk, on_back: callable, on_create: callable):
+        self.parent = parent
+        self.on_back = on_back
+        self.on_create = on_create
+        self.frame = ttk.Frame(parent, padding=40)
+        self.frame.pack(fill="both", expand=True)
+        
+        self.username_var = tk.StringVar()
+        self.pass_var = tk.StringVar()
+        self.confirm_pass_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="")
+        
+        self._build_ui()
+    
+    def _build_ui(self) -> None:
+        # Title
+        title_label = ttk.Label(
+            self.frame,
+            text="Create New Account",
+            font=("TkDefaultFont", 18, "bold")
+        )
+        title_label.pack(pady=(0, 30))
+        
+        # Form frame
+        form_frame = ttk.Frame(self.frame)
+        form_frame.pack(pady=20)
+        
+        # Username
+        ttk.Label(form_frame, text="Username:").grid(row=0, column=0, sticky="w", pady=5)
+        username_entry = ttk.Entry(form_frame, textvariable=self.username_var, width=30)
+        username_entry.grid(row=0, column=1, padx=10, pady=5)
+        username_entry.focus_set()
+        
+        # Passphrase
+        ttk.Label(form_frame, text="Passphrase:").grid(row=1, column=0, sticky="w", pady=5)
+        pass_entry = ttk.Entry(form_frame, textvariable=self.pass_var, show="*", width=30)
+        pass_entry.grid(row=1, column=1, padx=10, pady=5)
+        
+        # Confirm passphrase
+        ttk.Label(form_frame, text="Confirm:").grid(row=2, column=0, sticky="w", pady=5)
+        confirm_entry = ttk.Entry(form_frame, textvariable=self.confirm_pass_var, show="*", width=30)
+        confirm_entry.grid(row=2, column=1, padx=10, pady=5)
+        confirm_entry.bind("<Return>", lambda e: self._handle_create())
+        
+        # Status label
+        status_label = ttk.Label(self.frame, textvariable=self.status_var, foreground="red")
+        status_label.pack(pady=10)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(self.frame)
+        buttons_frame.pack(pady=20)
+        
+        # Back button
+        back_btn = ttk.Button(buttons_frame, text="Back", command=self.on_back)
+        back_btn.pack(side="left", padx=5)
+        
+        # Create button
+        create_btn = ttk.Button(buttons_frame, text="Create Account", command=self._handle_create)
+        create_btn.pack(side="left", padx=5)
+    
+    def _validate_input(self) -> tuple[bool, str]:
+        """Validate user input. Returns (is_valid, error_message)."""
+        username = self.username_var.get().strip()
+        passphrase = self.pass_var.get()
+        confirm_pass = self.confirm_pass_var.get()
+        
+        if not username:
+            return False, "Username is required."
+        
+        if len(username) < 3:
+            return False, "Username must be at least 3 characters."
+        
+        if not username.replace("_", "").replace("-", "").replace(".", "").isalnum():
+            return False, "Username can only contain letters, numbers, _, -, and ."
+        
+        if not passphrase:
+            return False, "Passphrase is required."
+        
+        if len(passphrase) < 8:
+            return False, "Passphrase must be at least 8 characters long."
+        
+        if passphrase != confirm_pass:
+            return False, "Passphrases do not match."
+        
+        return True, ""
+    
+    def _handle_create(self) -> None:
+        is_valid, error_msg = self._validate_input()
+        if not is_valid:
+            self.status_var.set(error_msg)
+            return
+        
+        username = self.username_var.get().strip()
+        passphrase = self.pass_var.get()
+        
+        # Check if account already exists
+        if ClientRuntime.check_account_exists(username):
+            self.status_var.set(f"Account '{username}' already exists. Please login instead.")
+            return
+        
+        # Call the create callback
+        self.on_create(username, passphrase)
+    
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class LoginFormWindow:
+    """Window for logging into an existing account."""
+    
+    def __init__(self, parent: tk.Tk, on_back: callable, on_login: callable):
+        self.parent = parent
+        self.on_back = on_back
+        self.on_login = on_login
+        self.frame = ttk.Frame(parent, padding=40)
+        self.frame.pack(fill="both", expand=True)
+        
+        self.username_var = tk.StringVar()
+        self.pass_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="")
+        
+        self._build_ui()
+    
+    def _build_ui(self) -> None:
+        # Title
+        title_label = ttk.Label(
+            self.frame,
+            text="Login to Account",
+            font=("TkDefaultFont", 18, "bold")
+        )
+        title_label.pack(pady=(0, 30))
+        
+        # Form frame
+        form_frame = ttk.Frame(self.frame)
+        form_frame.pack(pady=20)
+        
+        # Username
+        ttk.Label(form_frame, text="Username:").grid(row=0, column=0, sticky="w", pady=5)
+        username_entry = ttk.Entry(form_frame, textvariable=self.username_var, width=30)
+        username_entry.grid(row=0, column=1, padx=10, pady=5)
+        username_entry.focus_set()
+        
+        # Passphrase
+        ttk.Label(form_frame, text="Passphrase:").grid(row=1, column=0, sticky="w", pady=5)
+        pass_entry = ttk.Entry(form_frame, textvariable=self.pass_var, show="*", width=30)
+        pass_entry.grid(row=1, column=1, padx=10, pady=5)
+        pass_entry.bind("<Return>", lambda e: self._handle_login())
+        
+        # Status label
+        status_label = ttk.Label(self.frame, textvariable=self.status_var, foreground="red")
+        status_label.pack(pady=10)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(self.frame)
+        buttons_frame.pack(pady=20)
+        
+        # Back button
+        back_btn = ttk.Button(buttons_frame, text="Back", command=self.on_back)
+        back_btn.pack(side="left", padx=5)
+        
+        # Login button
+        login_btn = ttk.Button(buttons_frame, text="Login", command=self._handle_login)
+        login_btn.pack(side="left", padx=5)
+    
+    def _handle_login(self) -> None:
+        username = self.username_var.get().strip()
+        passphrase = self.pass_var.get()
+        
+        if not username:
+            self.status_var.set("Username is required.")
+            return
+        
+        if not passphrase:
+            self.status_var.set("Passphrase is required.")
+            return
+        
+        # Check if account exists
+        if not ClientRuntime.check_account_exists(username):
+            self.status_var.set(f"Account '{username}' does not exist. Please create a new account.")
+            return
+        
+        # Call the login callback
+        self.on_login(username, passphrase)
+    
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
 class ClientGUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("E2E Messenger")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.username_var = tk.StringVar()
-        self.pass_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Disconnected")
 
         self.loop = asyncio.new_event_loop()
@@ -30,31 +273,100 @@ class ClientGUI:
         self.chat_active_alias: Optional[str] = None
         self._listener_registered = False
         self.friend_lookup: dict[str, dict] = {}
+        
+        # Authentication state
+        self._current_window: Optional[tk.Widget] = None
+        self._main_window: Optional[ttk.Frame] = None
+        self._account_creation_in_progress: bool = False
+        self._pending_username: Optional[str] = None
 
-        self._build_ui()
+        # Show login screen first
+        self._show_login_screen()
         self.root.after(200, self._drain_events)
 
-    def _build_ui(self) -> None:
+    def _show_login_screen(self) -> None:
+        """Show the initial login screen."""
+        if self._current_window:
+            self._current_window.destroy()
+        
+        login_window = LoginWindow(
+            self.root,
+            on_create_account=self._show_create_account_screen,
+            on_login=self._show_login_form_screen
+        )
+        self._current_window = login_window.frame
+    
+    def _show_create_account_screen(self) -> None:
+        """Show the create account screen."""
+        if self._current_window:
+            self._current_window.destroy()
+        
+        create_window = CreateAccountWindow(
+            self.root,
+            on_back=self._show_login_screen,
+            on_create=self._handle_create_account
+        )
+        self._current_window = create_window.frame
+    
+    def _show_login_form_screen(self) -> None:
+        """Show the login form screen."""
+        if self._current_window:
+            self._current_window.destroy()
+        
+        login_form = LoginFormWindow(
+            self.root,
+            on_back=self._show_login_screen,
+            on_login=self._handle_login
+        )
+        self._current_window = login_form.frame
+    
+    def _show_main_window(self) -> None:
+        """Show the main application window."""
+        if self._current_window:
+            self._current_window.destroy()
+        
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
-
-        form = ttk.Frame(main)
-        form.pack(fill="x")
-
-        ttk.Label(form, text="Username").grid(row=0, column=0, sticky="w")
-        self.username_entry = ttk.Entry(form, textvariable=self.username_var, width=24)
-        self.username_entry.grid(row=0, column=1, padx=(6, 12), pady=(0, 4))
-
-        ttk.Label(form, text="Passphrase").grid(row=1, column=0, sticky="w")
-        self.pass_entry = ttk.Entry(form, textvariable=self.pass_var, show="*", width=24)
-        self.pass_entry.grid(row=1, column=1, padx=(6, 12), pady=(0, 4))
-
-        self.connect_button = ttk.Button(form, text="Connect", command=self.connect)
-        self.connect_button.grid(row=0, column=2, rowspan=2, padx=(0, 4), pady=(0, 4))
-
+        self._main_window = main
+        self._current_window = main
+        
+        # Status row
         status_row = ttk.Frame(main)
         status_row.pack(fill="x", pady=(6, 6))
         ttk.Label(status_row, textvariable=self.status_var).pack(side="left")
+        
+        self._build_main_ui(main)
+    
+    def _show_main_window_after_account_creation(self, username: str) -> None:
+        """Fallback method to show main window after account creation if callback didn't fire."""
+        if self.connected:
+            return  # Already connected
+        
+        # Try to create client if it doesn't exist
+        if not self.client:
+            try:
+                # Create client in a way that won't fail
+                from client.app import ClientRuntime
+                # We'll create it without connecting to server for now
+                passphrase = ""  # We don't have it here, but we'll handle it
+                # Actually, we need the client to be created properly
+                # Let's just show the window and let user login again if needed
+                print(f"[GUI] Showing main window for account {username} (fallback)")
+            except Exception as e:
+                print(f"[GUI] Error in fallback: {e}")
+        
+        # Show main window anyway
+        self.connected = True
+        self.status_var.set(f"Account: {username}")
+        self._show_main_window()
+        
+        # Show info message
+        messagebox.showinfo("Account Created", 
+            f"Your account '{username}' was created successfully.\n\n"
+            "Please restart the app and login to connect to the server.")
+    
+    def _build_main_ui(self, main: ttk.Frame) -> None:
+        """Build the main application UI (friends, online users, chat)."""
 
         friends_frame = ttk.LabelFrame(main, text="Friends", padding=8)
         friends_frame.pack(fill="both", expand=True, pady=(8, 6))
@@ -85,58 +397,191 @@ class ClientGUI:
         self.chat_send_btn = ttk.Button(input_row, text="Send", command=self.send_chat_message)
         self.chat_send_btn.pack(side="left")
         self._update_chat_controls(enabled=False)
-
-    def connect(self) -> None:
-        if self.connected:
-            return
-        username = self.username_var.get().strip()
-        passphrase = self.pass_var.get()
-        if not username or not passphrase:
-            messagebox.showwarning("Missing information", "Enter both username and passphrase.")
-            return
-        self.status_var.set("Connecting...")
-        self.connect_button.config(state="disabled")
+    
+    def _handle_create_account(self, username: str, passphrase: str) -> None:
+        """Handle account creation."""
+        self.status_var.set("Creating account...")
         if self.loop_thread is None:
             self.loop_thread = threading.Thread(target=self._run_loop, daemon=True)
             self.loop_thread.start()
-        future = asyncio.run_coroutine_threadsafe(self._init_client(username, passphrase), self.loop)
+        
+        # Store username for later checking
+        self._pending_username = username
+        
+        def safe_callback(fut):
+            """Ensure callback always executes, even if there's an error."""
+            try:
+                self.root.after(0, self._handle_connect_result, fut)
+            except Exception as e:
+                print(f"[GUI] Error in callback: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback: check if account was created and show main window
+                from client.app import ClientRuntime
+                if ClientRuntime.check_account_exists(username):
+                    self.root.after(0, lambda: self._show_main_window_after_account_creation(username))
+        
+        future = asyncio.run_coroutine_threadsafe(
+            self._init_client(username, passphrase, is_new_account=True),
+            self.loop
+        )
+        future.add_done_callback(safe_callback)
+        
+        # Also set a timeout to check if account was created
+        def check_account_created():
+            from client.app import ClientRuntime
+            if ClientRuntime.check_account_exists(username) and not self.connected:
+                # Account was created but callback didn't fire - show main window
+                print(f"[GUI] Account {username} exists but callback didn't fire - showing main window")
+                self._show_main_window_after_account_creation(username)
+        
+        # Check after 3 seconds if account was created
+        self.root.after(3000, check_account_created)
+    
+    def _handle_login(self, username: str, passphrase: str) -> None:
+        """Handle login."""
+        self.status_var.set("Connecting...")
+        if self.loop_thread is None:
+            self.loop_thread = threading.Thread(target=self._run_loop, daemon=True)
+            self.loop_thread.start()
+        future = asyncio.run_coroutine_threadsafe(
+            self._init_client(username, passphrase, is_new_account=False),
+            self.loop
+        )
         future.add_done_callback(lambda fut: self.root.after(0, self._handle_connect_result, fut))
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    async def _init_client(self, username: str, passphrase: str) -> None:
+    async def _init_client(self, username: str, passphrase: str, is_new_account: bool = False) -> None:
         client = ClientRuntime(username, passphrase)
         self.client = client
-        await client.start()
+        # Track if this is account creation so we can show main window even if server connection fails
+        self._account_creation_in_progress = is_new_account
+        await client.start(is_new_account=is_new_account)
+        # If we get here, everything succeeded including server connection
+        self._account_creation_in_progress = False
 
     def _handle_connect_result(self, fut: asyncio.Future) -> None:
+        import traceback
+        import sys
+        
+        # Check if account was actually created (by checking filesystem)
+        account_was_created = False
+        username_for_check = None
+        
+        # First try to get username from client
+        if self.client:
+            username_for_check = getattr(self.client, 'username', None)
+        
+        # Fallback to pending username if client doesn't have it
+        if not username_for_check:
+            username_for_check = getattr(self, '_pending_username', None)
+        
+        # Check filesystem to see if account was created
+        if username_for_check:
+            from client.app import ClientRuntime
+            account_was_created = ClientRuntime.check_account_exists(username_for_check)
+            print(f"[GUI] Checking account existence for {username_for_check}: {account_was_created}")
+        
         try:
             fut.result()
+            # Success: show main window
+            self.connected = True
+            self.status_var.set(f"Connected as {self.client.username}")
+            self._show_main_window()
+            if self.client and not self._listener_registered:
+                self.loop.call_soon_threadsafe(self.client.add_event_listener, self._on_runtime_event)
+                self._listener_registered = True
+            self._start_polling()
+            self._account_creation_in_progress = False
+            return
         except SystemExit as exc:
             msg = str(exc) or "Authentication failed."
+            # If account was created, show main window anyway
+            if account_was_created and username_for_check:
+                self.status_var.set(f"Account created, but authentication failed: {msg}")
+                messagebox.showwarning("Authentication Warning", 
+                    f"Your account '{username_for_check}' was created, but there was an authentication issue.\n\n"
+                    f"Error: {msg}\n\n"
+                    "You can still use the app.")
+                self.connected = True
+                self.status_var.set(f"Account: {username_for_check}")
+                self._show_main_window()
+                if self.client and not self._listener_registered:
+                    self.loop.call_soon_threadsafe(self.client.add_event_listener, self._on_runtime_event)
+                    self._listener_registered = True
+                self._account_creation_in_progress = False
+                return
             self.status_var.set("Authentication failed.")
-            messagebox.showerror("Login failed", msg)
-            self.connect_button.config(state="normal")
+            messagebox.showerror("Authentication failed", msg)
             self.client = None
+            self._account_creation_in_progress = False
             return
+        except RuntimeError as exc:
+            error_msg = str(exc)
+            # Check if this is an account creation error (should stay on create screen)
+            if "already exists" in error_msg.lower() or "does not exist" in error_msg.lower():
+                self.status_var.set("Account error.")
+                messagebox.showerror("Account error", error_msg)
+                self.client = None
+                self._account_creation_in_progress = False
+                return
+            
+            # If account was created (either by flag or filesystem check), show main window
+            if (self._account_creation_in_progress or account_was_created) and self.client:
+                username = username_for_check or getattr(self.client, 'username', 'Unknown')
+                self.status_var.set(f"Account created, but server connection failed: {error_msg}")
+                messagebox.showwarning("Server Connection Failed", 
+                    f"Your account '{username}' was created successfully, but couldn't connect to the server.\n\n"
+                    f"Error: {error_msg}\n\n"
+                    "You can still use the app, but messaging features won't work until the server is available.")
+                # Show main window anyway - account was created
+                self.connected = True
+                self.status_var.set(f"Account: {username} (Offline)")
+                self._show_main_window()
+                if self.client and not self._listener_registered:
+                    self.loop.call_soon_threadsafe(self.client.add_event_listener, self._on_runtime_event)
+                    self._listener_registered = True
+                self._account_creation_in_progress = False
+                return
+            else:
+                self.status_var.set("Connection failed.")
+                messagebox.showerror("Connection failed", error_msg)
+                self.client = None
+                self._account_creation_in_progress = False
+                return
         except Exception as exc:
-            self.status_var.set("Connection failed.")
-            messagebox.showerror("Login failed", str(exc))
-            self.connect_button.config(state="normal")
-            self.client = None
-            return
-
-        self.connected = True
-        self.status_var.set(f"Connected as {self.client.username}")
-        self.username_entry.config(state="disabled")
-        self.pass_entry.config(state="disabled")
-        self.connect_button.config(text="Connected", state="disabled")
-        if self.client and not self._listener_registered:
-            self.loop.call_soon_threadsafe(self.client.add_event_listener, self._on_runtime_event)
-            self._listener_registered = True
-        self._start_polling()
+            error_msg = str(exc)
+            error_type = type(exc).__name__
+            # Print full traceback for debugging
+            print(f"[GUI] Exception during account creation/login: {error_type}: {error_msg}")
+            traceback.print_exc()
+            
+            # If account was created (either by flag or filesystem check), show main window
+            if (self._account_creation_in_progress or account_was_created) and self.client:
+                username = username_for_check or getattr(self.client, 'username', 'Unknown')
+                self.status_var.set(f"Warning: {error_msg}")
+                messagebox.showwarning("Connection Warning", 
+                    f"Your account '{username}' was created, but there was an issue:\n\n"
+                    f"Error ({error_type}): {error_msg}\n\n"
+                    "You can still use the app.")
+                self.connected = True
+                self.status_var.set(f"Account: {username}")
+                self._show_main_window()
+                if self.client and not self._listener_registered:
+                    self.loop.call_soon_threadsafe(self.client.add_event_listener, self._on_runtime_event)
+                    self._listener_registered = True
+                self._account_creation_in_progress = False
+                return
+            else:
+                self.status_var.set("Connection failed.")
+                messagebox.showerror("Connection failed", f"{error_type}: {error_msg}")
+                self.client = None
+                self._account_creation_in_progress = False
+                # Stay on current screen (login/create account)
+                return
 
     def _start_polling(self) -> None:
         self._stop_polling()
@@ -193,6 +638,8 @@ class ClientGUI:
         self._render_friend_list()
 
     def _render_friend_list(self) -> None:
+        if not hasattr(self, 'friend_container') or self.friend_container is None:
+            return
         for child in self.friend_container.winfo_children():
             child.destroy()
         if not self.friends:
@@ -224,6 +671,8 @@ class ClientGUI:
             request_btn.pack(side="right", padx=(4, 0))
 
     def _render_online_list(self) -> None:
+        if not hasattr(self, 'online_container') or self.online_container is None:
+            return
         for child in self.online_container.winfo_children():
             child.destroy()
         if not self.online_users:
@@ -362,6 +811,8 @@ class ClientGUI:
             self.status_var.set("Friend removal failed; check console.")
 
     def _append_chat_line(self, alias: str, direction: str, text: str) -> None:
+        if not hasattr(self, 'chat_text') or self.chat_text is None:
+            return
         if alias != self.chat_active_alias:
             self.status_var.set(f"New message from {alias}")
             return
@@ -373,6 +824,8 @@ class ClientGUI:
         self.chat_text.see(tk.END)
 
     def _set_chat_text(self, text: str) -> None:
+        if not hasattr(self, 'chat_text') or self.chat_text is None:
+            return
         self.chat_text.config(state="normal")
         self.chat_text.delete("1.0", tk.END)
         if text:

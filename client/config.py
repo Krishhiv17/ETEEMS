@@ -30,4 +30,6 @@ AD_MESSAGES  = b"e2e-messages-v1"
 GCM_NONCE_LEN = 12  # 96-bit as recommended
 
 
-WS_BASE = os.environ.get("E2E_WS_BASE", "ws://10.2.52.219:5088")
+# Default to localhost for client ↔ server websocket/tcp base.
+# Users can override with E2E_WS_BASE if connecting to a remote server.
+WS_BASE = os.environ.get("E2E_WS_BASE", "ws://127.0.0.1:5088")
