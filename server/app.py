@@ -1,4 +1,4 @@
-import asyncio, json, os, base64, secrets, signal, re, sys
+import asyncio, json, os, base64, secrets, signal, re, sys, hmac, hashlib
 from typing import Optional, Dict, Any
 
 # Allow running as script (python server/app.py) or as module (python -m server.app)
@@ -15,6 +15,8 @@ HOST = os.environ.get("E2E_HOST", "0.0.0.0")
 PORT = int(os.environ.get("E2E_PORT", "5088"))
 DB_PATH = os.environ.get("E2E_DB_PATH", "./server/server.db")
 MAX_ACTIVE_DEVICES = 2
+DEVICE_ID_KEY_ENV = os.environ.get("DEVICE_ID_KEY")
+DEVICE_ADMIN_KEY_ENV = os.environ.get("DEVICE_ADMIN_KEY")  # required for encrypted MAC storage
 
 DB = ServerDB(DB_PATH)
 
@@ -84,6 +86,45 @@ def normalize_mac(mac: str) -> Optional[str]:
         return None
     return ":".join(s[i:i+2] for i in range(0, 12, 2))
 
+def _decode_key_material(raw: Optional[str], label: str) -> Optional[bytes]:
+    if not raw:
+        return None
+    raw = raw.strip()
+    for decoder in (base64.b64decode, bytes.fromhex):
+        try:
+            key = decoder(raw)
+            if key:
+                return key
+        except Exception:
+            continue
+    raise RuntimeError(f"Invalid {label}; provide base64 or hex key material.")
+
+DEVICE_ID_KEY = _decode_key_material(DEVICE_ID_KEY_ENV, "DEVICE_ID_KEY")
+DEVICE_ADMIN_KEY = _decode_key_material(DEVICE_ADMIN_KEY_ENV, "DEVICE_ADMIN_KEY")
+
+def compute_mac_hash(mac_normalized: str) -> str:
+    if not DEVICE_ID_KEY:
+        raise RuntimeError("DEVICE_ID_KEY is required for MAC hashing.")
+    return hmac.new(DEVICE_ID_KEY, mac_normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def encrypt_mac(mac_normalized: str) -> Optional[bytes]:
+    """
+    Encrypt the MAC for admin visibility using DEVICE_ADMIN_KEY.
+    Returns nonce||ciphertext; raises if key is missing/invalid.
+    """
+    if not DEVICE_ADMIN_KEY:
+        raise RuntimeError("DEVICE_ADMIN_KEY is required for MAC encryption.")
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except Exception:
+        raise RuntimeError("cryptography AESGCM unavailable")
+    if len(DEVICE_ADMIN_KEY) not in (16, 24, 32):
+        raise RuntimeError("DEVICE_ADMIN_KEY must be 16/24/32 bytes after decode")
+    aes = AESGCM(DEVICE_ADMIN_KEY)
+    nonce = secrets.token_bytes(12)
+    ct = aes.encrypt(nonce, mac_normalized.encode("utf-8"), None)
+    return nonce + ct
+
 # --------------- in-memory directory & queues ----------------
 
 class UserState:
@@ -134,6 +175,12 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         if not mac_norm:
             await send_json(writer, {"type": "ERR", "reason": "INVALID_MAC"})
             writer.close(); await writer.wait_closed(); return
+        try:
+            mac_hash = compute_mac_hash(mac_norm)
+            mac_enc = encrypt_mac(mac_norm)
+        except Exception as exc:
+            await send_json(writer, {"type": "ERR", "reason": "SERVER_CONFIG", "message": str(exc)})
+            writer.close(); await writer.wait_closed(); return
 
         try:
             pub = load_public_key_pem(pub_pem)
@@ -150,7 +197,7 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         # Persist user + device; enforce device limit
         try:
             DB.register_or_update_user(username, pub_pem.encode("utf-8"))
-            allowed = DB.register_device(username, mac_norm)
+            allowed = DB.register_device(username, mac_hash, mac_enc=mac_enc)
         except Exception:
             allowed = False
         if not allowed:

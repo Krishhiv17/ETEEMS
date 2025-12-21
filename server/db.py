@@ -14,16 +14,17 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS devices (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL,
-  mac_address   TEXT NOT NULL,
+  mac_hash      TEXT NOT NULL,
+  mac_enc       BLOB,
   registered_at INTEGER NOT NULL,
   last_seen     INTEGER NOT NULL,
   is_active     INTEGER NOT NULL DEFAULT 1,
   FOREIGN KEY(username) REFERENCES users(name) ON DELETE CASCADE,
-  UNIQUE(username, mac_address)
+  UNIQUE(username, mac_hash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_username ON devices(username);
-CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac_address);
+CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac_hash);
 
 CREATE TABLE IF NOT EXISTS queue (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,27 +73,27 @@ class ServerDB:
         ).fetchone()
         return int(row["c"]) if row else 0
 
-    def register_device(self, username: str, mac_address: str) -> bool:
+    def register_device(self, username: str, mac_hash: str, mac_enc: Optional[bytes] = None) -> bool:
         """
         Register device if under the limit (2). Returns True if allowed/registered,
         False if limit exceeded.
         """
         now = int(time.time())
         row = self.conn.execute(
-            "SELECT is_active FROM devices WHERE username=? AND mac_address=?",
-            (username, mac_address),
+            "SELECT is_active FROM devices WHERE username=? AND mac_hash=?",
+            (username, mac_hash),
         ).fetchone()
 
         # Existing device: just update last_seen and reactivate if needed
         if row:
             is_active = bool(row["is_active"])
             if is_active:
-                self.update_device_last_seen(username, mac_address)
+                self.update_device_last_seen(username, mac_hash)
                 return True
             if self._active_device_count(username) < 2:
                 self.conn.execute(
-                    "UPDATE devices SET is_active=1, last_seen=? WHERE username=? AND mac_address=?",
-                    (now, username, mac_address),
+                    "UPDATE devices SET is_active=1, last_seen=?, mac_enc=COALESCE(?, mac_enc) WHERE username=? AND mac_hash=?",
+                    (now, mac_enc, username, mac_hash),
                 )
                 self.conn.commit()
                 return True
@@ -103,28 +104,28 @@ class ServerDB:
             return False
 
         self.conn.execute(
-            "INSERT INTO devices(username, mac_address, registered_at, last_seen, is_active) "
-            "VALUES(?, ?, ?, ?, 1)",
-            (username, mac_address, now, now),
+            "INSERT INTO devices(username, mac_hash, mac_enc, registered_at, last_seen, is_active) "
+            "VALUES(?, ?, ?, ?, ?, 1)",
+            (username, mac_hash, mac_enc, now, now),
         )
         self.conn.commit()
         return True
 
-    def is_device_allowed(self, username: str, mac_address: str) -> bool:
+    def is_device_allowed(self, username: str, mac_hash: str) -> bool:
         row = self.conn.execute(
-            "SELECT is_active FROM devices WHERE username=? AND mac_address=?",
-            (username, mac_address),
+            "SELECT is_active FROM devices WHERE username=? AND mac_hash=?",
+            (username, mac_hash),
         ).fetchone()
         if row:
             return bool(row["is_active"])
         # Not registered yet: allowed only if active count < 2
         return self._active_device_count(username) < 2
 
-    def update_device_last_seen(self, username: str, mac_address: str) -> None:
+    def update_device_last_seen(self, username: str, mac_hash: str) -> None:
         now = int(time.time())
         self.conn.execute(
-            "UPDATE devices SET last_seen=?, is_active=1 WHERE username=? AND mac_address=?",
-            (now, username, mac_address),
+            "UPDATE devices SET last_seen=?, is_active=1 WHERE username=? AND mac_hash=?",
+            (now, username, mac_hash),
         )
         self.conn.commit()
 
@@ -134,10 +135,10 @@ class ServerDB:
             (username,),
         ).fetchall()
 
-    def deactivate_device(self, username: str, mac_address: str) -> None:
+    def deactivate_device(self, username: str, mac_hash: str) -> None:
         self.conn.execute(
-            "UPDATE devices SET is_active=0 WHERE username=? AND mac_address=?",
-            (username, mac_address),
+            "UPDATE devices SET is_active=0 WHERE username=? AND mac_hash=?",
+            (username, mac_hash),
         )
         self.conn.commit()
 
