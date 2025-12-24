@@ -3,12 +3,14 @@ from collections import deque
 from typing import Optional, Tuple, Dict, Callable, Awaitable, List
 from client.config import WS_BASE  # e.g., "ws://127.0.0.1:5088"
 from client.transport import Transport
-from client.storage import Storage
+from client.storage import Storage, serialize_ratchet_state, deserialize_ratchet_state
 from client.framing import (
     build_frame, parse_and_verify_frame,
+    build_ratchet_frame, parse_and_verify_ratchet_frame, parse_ratchet_header, RATCHET_VERSION,
     BadTag, ReplayError, OutOfOrderError, ShortFrame,
 )
-from client.crypto import hkdf_derive, dh_gen, dh_shared  # uses your Phase-2 helpers
+from client.crypto import hkdf_derive, dh_gen, dh_shared
+from client.ratchet import DoubleRatchet, derive_message_keys  # uses your Phase-2 helpers
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -131,12 +133,15 @@ def db_get_session(s: Storage, contact: str) -> Optional[dict]:
         "k_enc_ba": bundle_ba["K_enc"],
         "k_mac_ba": bundle_ba["K_mac"],
         "ivseed_ba": bundle_ba["IVseed"],
+        "ratchet_state": sess.get("ratchet_state"),
+        "ratchet_version": int(sess.get("ratchet_version", 1)),
     }
 
 def db_put_session(s: Storage, contact: str, session_id: int,
                    Kenc_ab: bytes, Kmac_ab: bytes, IVseed_ab: bytes,
                    Kenc_ba: bytes, Kmac_ba: bytes, IVseed_ba: bytes,
-                   seq_send: int, seq_recv_next: int) -> None:
+                   seq_send: int, seq_recv_next: int,
+                   ratchet_state: Optional[bytes] = None, ratchet_version: int = 1) -> None:
     s.session_upsert(
         contact=contact,
         session_id=session_id,
@@ -145,6 +150,8 @@ def db_put_session(s: Storage, contact: str, session_id: int,
         seq_send=seq_send,
         seq_recv_next=seq_recv_next,
         last_rekey_at=int(time.time()),
+        ratchet_state=ratchet_state,
+        ratchet_version=ratchet_version,
     )
 
 def db_bump_seq_send(s: Storage, contact: str, new_seq: int) -> None:
@@ -392,10 +399,39 @@ class ClientRuntime:
         await self._send_text_with_session(alias, remote_username, sess, text)
 
     async def _send_text_with_session(self, alias: str, remote_username: str, sess: dict, text: str) -> None:
-        seq = int(sess["seq_send"])
-        keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
         sid = int(sess["session_id"])
         pt = text.encode("utf-8")
+        if int(sess.get("ratchet_version", 1)) == 2 and sess.get("ratchet_state"):
+            state = deserialize_ratchet_state(sess["ratchet_state"])
+            ratchet = DoubleRatchet(state)
+            header, mk_bundle = ratchet.ratchet_encrypt(pt)
+            keys = derive_message_keys(mk_bundle["message_key"])
+            frame = build_ratchet_frame(
+                keys,
+                msg_num=int(header["msg_num"]),
+                prev_chain_len=int(header["prev_chain_len"]),
+                plaintext=pt,
+                dh_pub=header.get("dh_pub"),
+            )
+            await self.transport.send_frame(remote_username, sid, frame)
+            db_store_message(self.storage, alias, "out", sid, int(header["msg_num"]), pt)
+            self.storage.session_update_ratchet_state(
+                alias,
+                serialize_ratchet_state(ratchet.state),
+                ratchet_version=2,
+            )
+            self._notify_event({
+                "type": "message",
+                "alias": alias,
+                "remote": remote_username,
+                "direction": "out",
+                "text": text,
+                "session_id": sid,
+                "seq": int(header["msg_num"]),
+            })
+            return
+        seq = int(sess["seq_send"])
+        keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
         frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
         await self.transport.send_frame(remote_username, sid, frame)
         db_store_message(self.storage, alias, "out", sid, seq, pt)
@@ -420,9 +456,44 @@ class ClientRuntime:
         if not sess:
             self._pending_messages.setdefault(alias, []).extend(pending)
             return
+        sid = int(sess["session_id"])
+        if int(sess.get("ratchet_version", 1)) == 2 and sess.get("ratchet_state"):
+            state = deserialize_ratchet_state(sess["ratchet_state"])
+            ratchet = DoubleRatchet(state)
+            for idx, text in enumerate(pending):
+                pt = text.encode("utf-8")
+                header, mk_bundle = ratchet.ratchet_encrypt(pt)
+                keys = derive_message_keys(mk_bundle["message_key"])
+                frame = build_ratchet_frame(
+                    keys,
+                    msg_num=int(header["msg_num"]),
+                    prev_chain_len=int(header["prev_chain_len"]),
+                    plaintext=pt,
+                    dh_pub=header.get("dh_pub"),
+                )
+                try:
+                    await self.transport.send_frame(remote_username, sid, frame)
+                except Exception:
+                    self._pending_messages.setdefault(alias, []).extend(pending[idx:])
+                    raise
+                db_store_message(self.storage, alias, "out", sid, int(header["msg_num"]), pt)
+                self._notify_event({
+                    "type": "message",
+                    "alias": alias,
+                    "remote": remote_username,
+                    "direction": "out",
+                    "text": text,
+                    "session_id": sid,
+                    "seq": int(header["msg_num"]),
+                })
+            self.storage.session_update_ratchet_state(
+                alias,
+                serialize_ratchet_state(ratchet.state),
+                ratchet_version=2,
+            )
+            return
         seq = int(sess["seq_send"])
         keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
-        sid = int(sess["session_id"])
         for idx, text in enumerate(pending):
             pt = text.encode("utf-8")
             frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
@@ -494,6 +565,15 @@ class ClientRuntime:
             s_int = dh_shared(b, peer_pub)
             s_bytes = int_to_bytes(s_int)
             AtoB, BtoA = derive_keys(s_bytes, from_user, self.username)
+            ratchet = DoubleRatchet.initialize(
+                s_bytes,
+                initiator=False,
+                a_name=from_user,
+                b_name=self.username,
+                dh_priv=b,
+                dh_pub=B,
+                dh_peer=peer_pub,
+            )
             db_put_session(
                 self.storage,
                 alias,
@@ -502,6 +582,8 @@ class ClientRuntime:
                 Kenc_ba=AtoB["K_enc"], Kmac_ba=AtoB["K_mac"], IVseed_ba=AtoB["IVseed"],
                 seq_send=0,
                 seq_recv_next=0,
+                ratchet_state=serialize_ratchet_state(ratchet.state),
+                ratchet_version=2,
             )
             resp = build_resp_payload(sid, B, self.username)
             await self.transport.send_session(from_user, resp)
@@ -522,6 +604,15 @@ class ClientRuntime:
             s_int = dh_shared(a, peer_pub)
             s_bytes = int_to_bytes(s_int)
             AtoB, BtoA = derive_keys(s_bytes, self.username, from_user)
+            ratchet = DoubleRatchet.initialize(
+                s_bytes,
+                initiator=True,
+                a_name=self.username,
+                b_name=from_user,
+                dh_priv=a,
+                dh_pub=_A,
+                dh_peer=peer_pub,
+            )
             db_put_session(
                 self.storage,
                 alias,
@@ -530,6 +621,8 @@ class ClientRuntime:
                 Kenc_ba=BtoA["K_enc"], Kmac_ba=BtoA["K_mac"], IVseed_ba=BtoA["IVseed"],
                 seq_send=0,
                 seq_recv_next=0,
+                ratchet_state=serialize_ratchet_state(ratchet.state),
+                ratchet_version=2,
             )
             self.active_contact = alias
             print(f"[session:init→ready] with {alias} sid={sid}, keys installed")
@@ -553,42 +646,83 @@ class ClientRuntime:
         if not sess or int(sess["session_id"]) != int(session_id):
             print(f"[recv] unknown session from={from_user} sid={session_id}")
             return
-        expected = int(sess["seq_recv_next"])
-        keys = {"K_enc": sess["k_enc_ba"], "K_mac": sess["k_mac_ba"], "IVseed": sess["ivseed_ba"]}
+        if frame and frame[0] == RATCHET_VERSION and int(sess.get("ratchet_version", 1)) == 2 and sess.get("ratchet_state"):
+            try:
+                header, _ = parse_ratchet_header(frame)
+                state = deserialize_ratchet_state(sess["ratchet_state"])
+                ratchet = DoubleRatchet(state)
+                mk = ratchet.ratchet_decrypt(header)
+                keys = derive_message_keys(mk)
+                header2, pt = parse_and_verify_ratchet_frame(keys, frame)
+                seq = int(header2["msg_num"])
+            except BadTag:
+                print(f"[recv] BAD TAG from {from_user} (tampered?)")
+                return
+            except ShortFrame:
+                print(f"[recv] short/bad frame from {from_user}")
+                return
+            except Exception as exc:
+                print(f"[recv] ratchet error from {from_user}: {exc}")
+                return
 
-        try:
-            (_v,_f,_sid, seq), pt = parse_and_verify_frame(keys, frame, expected_session_id=session_id, expected_seq=expected)
-        except ReplayError:
-            print(f"[recv] replay from {from_user} (ignored)")
-            return
-        except OutOfOrderError:
-            print(f"[recv] out-of-order from {from_user} (ignored)")
-            return
-        except BadTag:
-            print(f"[recv] BAD TAG from {from_user} (tampered?)")
-            return
-        except ShortFrame:
-            print(f"[recv] short/bad frame from {from_user}")
-            return
+            db_store_message(self.storage, alias, "in", session_id, seq, pt)
+            self.storage.session_update_ratchet_state(
+                alias,
+                serialize_ratchet_state(ratchet.state),
+                ratchet_version=2,
+            )
+            try:
+                print(f"{from_user}: {pt.decode('utf-8', errors='replace')}")
+            except Exception:
+                print(f"{from_user}: <{len(pt)} bytes>")
+            alias_name = self._alias_for_remote(from_user) or from_user
+            text_display = pt.decode("utf-8", errors="replace")
+            self._notify_event({
+                "type": "message",
+                "alias": alias_name,
+                "remote": from_user,
+                "direction": "in",
+                "text": text_display,
+                "session_id": session_id,
+                "seq": seq,
+            })
+        else:
+            expected = int(sess["seq_recv_next"])
+            keys = {"K_enc": sess["k_enc_ba"], "K_mac": sess["k_mac_ba"], "IVseed": sess["ivseed_ba"]}
 
-        # accept
-        db_store_message(self.storage, alias, "in", session_id, seq, pt)
-        db_set_seq_recv_next(self.storage, alias, seq + 1)
-        try:
-            print(f"{from_user}: {pt.decode('utf-8', errors='replace')}")
-        except Exception:
-            print(f"{from_user}: <{len(pt)} bytes>")
-        alias_name = self._alias_for_remote(from_user) or from_user
-        text_display = pt.decode("utf-8", errors="replace")
-        self._notify_event({
-            "type": "message",
-            "alias": alias_name,
-            "remote": from_user,
-            "direction": "in",
-            "text": text_display,
-            "session_id": session_id,
-            "seq": seq,
-        })
+            try:
+                (_v,_f,_sid, seq), pt = parse_and_verify_frame(keys, frame, expected_session_id=session_id, expected_seq=expected)
+            except ReplayError:
+                print(f"[recv] replay from {from_user} (ignored)")
+                return
+            except OutOfOrderError:
+                print(f"[recv] out-of-order from {from_user} (ignored)")
+                return
+            except BadTag:
+                print(f"[recv] BAD TAG from {from_user} (tampered?)")
+                return
+            except ShortFrame:
+                print(f"[recv] short/bad frame from {from_user}")
+                return
+
+            # accept
+            db_store_message(self.storage, alias, "in", session_id, seq, pt)
+            db_set_seq_recv_next(self.storage, alias, seq + 1)
+            try:
+                print(f"{from_user}: {pt.decode('utf-8', errors='replace')}")
+            except Exception:
+                print(f"{from_user}: <{len(pt)} bytes>")
+            alias_name = self._alias_for_remote(from_user) or from_user
+            text_display = pt.decode("utf-8", errors="replace")
+            self._notify_event({
+                "type": "message",
+                "alias": alias_name,
+                "remote": from_user,
+                "direction": "in",
+                "text": text_display,
+                "session_id": session_id,
+                "seq": seq,
+            })
         if restore_prompt and self._prompt_render:
             try:
                 await self._prompt_render()

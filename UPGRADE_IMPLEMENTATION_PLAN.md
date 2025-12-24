@@ -160,7 +160,7 @@ Enforce that each user can only connect from 2 registered MAC addresses. Server 
 
 ---
 
-## Phase 3: Remove Chat Requests / Auto-Session Establishment
+## Phase 3: Remove Chat Requests / Auto-Session Establishment 
 
 ### Objective
 Eliminate the chat request/accept workflow. Messages should automatically establish sessions if needed, making the system more intuitive.

@@ -23,6 +23,19 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .ratchet import DoubleRatchetState
+
+# ---------- Ratchet state helpers ----------
+
+def serialize_ratchet_state(state: DoubleRatchetState) -> bytes:
+    return json.dumps(state.to_dict(), separators=(",", ":")).encode("utf-8")
+
+
+def deserialize_ratchet_state(data: bytes) -> DoubleRatchetState:
+    obj = json.loads(data.decode("utf-8"))
+    return DoubleRatchetState.from_dict(obj)
+
+
 from .config import (
     HOME_DIR, DB_PATH,
     SQLITE_JOURNAL_MODE, SQLITE_FOREIGN_KEYS,
@@ -132,9 +145,25 @@ class Storage:
           bundle_ba_nonce     BLOB NOT NULL,
           seq_send            INTEGER NOT NULL,
           seq_recv_next       INTEGER NOT NULL,
-          last_rekey_at       INTEGER NOT NULL
+          last_rekey_at       INTEGER NOT NULL,
+          ratchet_state_ct    BLOB,
+          ratchet_state_nonce BLOB,
+          ratchet_version     INTEGER DEFAULT 1
         );
         """)
+
+        try:
+            cur.execute("ALTER TABLE sessions ADD COLUMN ratchet_state_ct BLOB")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("ALTER TABLE sessions ADD COLUMN ratchet_state_nonce BLOB")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("ALTER TABLE sessions ADD COLUMN ratchet_version INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
 
         # Messages (store metadata plaintext; body: plaintext OR encrypted with DEK)
         cur.execute("""
@@ -300,6 +329,8 @@ class Storage:
         seq_send: int = 0,
         seq_recv_next: int = 0,
         last_rekey_at: Optional[int] = None,
+        ratchet_state: Optional[bytes] = None,
+        ratchet_version: int = 1,
     ):
         self._require_unlocked()
         if last_rekey_at is None:
@@ -315,9 +346,21 @@ class Storage:
         ab_ct = aes.encrypt(ab_nonce, ab_bytes, AD_SESSIONS)
         ba_ct = aes.encrypt(ba_nonce, ba_bytes, AD_SESSIONS)
 
+        ratchet_state_ct = None
+        ratchet_state_nonce = None
+        if ratchet_state is not None:
+            ratchet_state_nonce = os.urandom(GCM_NONCE_LEN)
+            ratchet_state_ct = aes.encrypt(ratchet_state_nonce, ratchet_state, AD_SESSIONS)
+
         self.conn.execute("""
-            INSERT INTO sessions(contact, session_id, bundle_ab_ct, bundle_ab_nonce, bundle_ba_ct, bundle_ba_nonce, seq_send, seq_recv_next, last_rekey_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions(
+                contact, session_id,
+                bundle_ab_ct, bundle_ab_nonce,
+                bundle_ba_ct, bundle_ba_nonce,
+                seq_send, seq_recv_next, last_rekey_at,
+                ratchet_state_ct, ratchet_state_nonce, ratchet_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact) DO UPDATE SET
               session_id=excluded.session_id,
               bundle_ab_ct=excluded.bundle_ab_ct,
@@ -326,10 +369,24 @@ class Storage:
               bundle_ba_nonce=excluded.bundle_ba_nonce,
               seq_send=excluded.seq_send,
               seq_recv_next=excluded.seq_recv_next,
-              last_rekey_at=excluded.last_rekey_at
-        """, (contact, session_id, ab_ct, ab_nonce, ba_ct, ba_nonce, seq_send, seq_recv_next, last_rekey_at))
+              last_rekey_at=excluded.last_rekey_at,
+              ratchet_state_ct=excluded.ratchet_state_ct,
+              ratchet_state_nonce=excluded.ratchet_state_nonce,
+              ratchet_version=excluded.ratchet_version
+        """, (contact, session_id, ab_ct, ab_nonce, ba_ct, ba_nonce, seq_send, seq_recv_next, last_rekey_at, ratchet_state_ct, ratchet_state_nonce, ratchet_version))
         self.conn.commit()
         
+    def session_update_ratchet_state(self, contact: str, ratchet_state: bytes, ratchet_version: int = 2):
+        self._require_unlocked()
+        aes = AESGCM(self._dek)
+        nonce = os.urandom(GCM_NONCE_LEN)
+        ct = aes.encrypt(nonce, ratchet_state, AD_SESSIONS)
+        self.conn.execute(
+            "UPDATE sessions SET ratchet_state_ct=?, ratchet_state_nonce=?, ratchet_version=? WHERE contact=?",
+            (ct, nonce, ratchet_version, contact),
+        )
+        self.conn.commit()
+
     def session_get(self, contact: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute("SELECT * FROM sessions WHERE contact=?", (contact,)).fetchone()
         if not row:
@@ -341,6 +398,7 @@ class Storage:
             "seq_send": int(row["seq_send"]),
             "seq_recv_next": int(row["seq_recv_next"]),
             "last_rekey_at": int(row["last_rekey_at"]),
+            "ratchet_version": int(row["ratchet_version"]) if row["ratchet_version"] is not None else 1,
         }
         if self._dek is not None:
             aes = AESGCM(self._dek)
@@ -348,9 +406,15 @@ class Storage:
             ba_bytes = aes.decrypt(row["bundle_ba_nonce"], row["bundle_ba_ct"], AD_SESSIONS)
             result["bundle_ab"] = _deserialize_bundle(ab_bytes)
             result["bundle_ba"] = _deserialize_bundle(ba_bytes)
+            if row["ratchet_state_ct"] is not None and row["ratchet_state_nonce"] is not None:
+                rs_bytes = aes.decrypt(row["ratchet_state_nonce"], row["ratchet_state_ct"], AD_SESSIONS)
+                result["ratchet_state"] = rs_bytes
+            else:
+                result["ratchet_state"] = None
         else:
             result["bundle_ab"] = None
             result["bundle_ba"] = None
+            result["ratchet_state"] = None
         return result
     
     def seq_get_send(self, contact: str) -> int:
@@ -424,6 +488,8 @@ class Storage:
                 entry["text"] = None
             out.append(entry)
         return out
+
+    
 
     # ---------- Internals ----------
     

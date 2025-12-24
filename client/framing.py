@@ -46,6 +46,22 @@ class UnknownSession(FrameFormatError):
 
 _HDR_STRUCT = struct.Struct("!BBHI")
 
+RATCHET_VERSION = 0x02
+RATCHET_FLAG_DH = 0x01
+_RATCHET_HDR_STRUCT = struct.Struct('!BBIIH')
+
+
+def _int_to_bytes(n: int) -> bytes:
+    if n == 0:
+        return b'\x00'
+    l = (n.bit_length() + 7) // 8
+    return n.to_bytes(l, 'big')
+
+
+def _bytes_to_int(b: bytes) -> int:
+    return int.from_bytes(b, 'big')
+
+
 
 def pack_header(flags: int, session_id: int, seq: int, version: int = FRAME_VERSION) -> bytes:
     """
@@ -172,3 +188,82 @@ def parse_and_verify_frame(
     # All good → decrypt
     pt = aes_ctr_decrypt(keys_dir["K_enc"], iv, ct)
     return (ver, flags, sid, seq), pt
+
+# ----- Ratchet frames (v2) -----
+
+def build_ratchet_frame(
+    keys_dir: dict[str, bytes],
+    msg_num: int,
+    prev_chain_len: int,
+    plaintext: bytes,
+    dh_pub: int | None = None,
+) -> bytes:
+    if plaintext is None:
+        plaintext = b''
+    flags = RATCHET_FLAG_DH if dh_pub is not None else 0
+    dh_bytes = _int_to_bytes(dh_pub) if dh_pub is not None else b''
+    header = _RATCHET_HDR_STRUCT.pack(RATCHET_VERSION, flags, prev_chain_len, msg_num, len(dh_bytes)) + dh_bytes
+    iv = derive_iv(keys_dir['IVseed'], msg_num)
+    ct = aes_ctr_encrypt(keys_dir['K_enc'], iv, plaintext)
+    tag = hmac_tag(keys_dir['K_mac'], header + iv + ct)
+    frame = header + iv + ct + tag
+    if len(frame) > MAX_FRAME_LEN:
+        raise OversizedFrame(f'frame length {len(frame)} > MAX_FRAME_LEN {MAX_FRAME_LEN}')
+    return frame
+
+
+def parse_and_verify_ratchet_frame(
+    keys_dir: dict[str, bytes],
+    frame: bytes,
+) -> tuple[dict, bytes]:
+    if frame is None:
+        raise ShortFrame('empty frame')
+    n = len(frame)
+    min_len = _RATCHET_HDR_STRUCT.size + IV_LEN + TAG_LEN
+    if n < min_len:
+        raise ShortFrame(f'frame length {n} < minimal {min_len}')
+    if n > MAX_FRAME_LEN:
+        raise OversizedFrame(f'frame length {n} > MAX_FRAME_LEN {MAX_FRAME_LEN}')
+
+    version, flags, prev_chain_len, msg_num, dh_len = _RATCHET_HDR_STRUCT.unpack(frame[:_RATCHET_HDR_STRUCT.size])
+    if version != RATCHET_VERSION:
+        raise BadVersion(f'got {version}, expected {RATCHET_VERSION}')
+    off = _RATCHET_HDR_STRUCT.size
+    dh_pub = None
+    if dh_len:
+        dh_bytes = frame[off:off+dh_len]
+        dh_pub = _bytes_to_int(dh_bytes)
+        off += dh_len
+    iv = frame[off:off+IV_LEN]
+    tag = frame[-TAG_LEN:]
+    ct = frame[off+IV_LEN:-TAG_LEN]
+    exp = hmac_tag(keys_dir['K_mac'], frame[:off] + iv + ct)
+    if not ct_eq(exp, tag):
+        raise BadTag('HMAC verification failed')
+    pt = aes_ctr_decrypt(keys_dir['K_enc'], iv, ct)
+    header = {
+        'dh_pub': dh_pub,
+        'prev_chain_len': prev_chain_len,
+        'msg_num': msg_num,
+    }
+    return header, pt
+
+
+def parse_ratchet_header(frame: bytes) -> tuple[dict, int]:
+    if frame is None or len(frame) < _RATCHET_HDR_STRUCT.size:
+        raise ShortFrame('empty frame')
+    version, flags, prev_chain_len, msg_num, dh_len = _RATCHET_HDR_STRUCT.unpack(frame[:_RATCHET_HDR_STRUCT.size])
+    if version != RATCHET_VERSION:
+        raise BadVersion(f'got {version}, expected {RATCHET_VERSION}')
+    off = _RATCHET_HDR_STRUCT.size
+    dh_pub = None
+    if dh_len:
+        dh_bytes = frame[off:off+dh_len]
+        dh_pub = _bytes_to_int(dh_bytes)
+        off += dh_len
+    header = {
+        'dh_pub': dh_pub,
+        'prev_chain_len': prev_chain_len,
+        'msg_num': msg_num,
+    }
+    return header, off

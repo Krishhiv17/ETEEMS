@@ -411,29 +411,23 @@ class ClientGUI:
         if self.loop_thread is None:
             self.loop_thread = threading.Thread(target=self._run_loop, daemon=True)
             self.loop_thread.start()
-        
+
         # Store username for later checking
         self._pending_username = username
-        
-        def safe_callback(fut):
-            """Ensure callback always executes, even if there's an error."""
-            try:
-                self.root.after(0, self._handle_connect_result, fut)
-            except Exception as e:
-                print(f"[GUI] Error in callback: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback: check if account was created and show main window
-                from client.app import ClientRuntime
-                if ClientRuntime.check_account_exists(username):
-                    self.root.after(0, lambda: self._show_main_window_after_account_creation(username))
-        
+
         future = asyncio.run_coroutine_threadsafe(
             self._init_client(username, passphrase, is_new_account=True),
             self.loop
         )
-        future.add_done_callback(safe_callback)
-        
+
+        def check_future() -> None:
+            if future.done():
+                self._handle_connect_result(future)
+                return
+            self.root.after(100, check_future)
+
+        self.root.after(100, check_future)
+
         # Also set a timeout to check if account was created
         def check_account_created():
             from client.app import ClientRuntime
@@ -441,7 +435,7 @@ class ClientGUI:
                 # Account was created but callback didn't fire - show main window
                 print(f"[GUI] Account {username} exists but callback didn't fire - showing main window")
                 self._show_main_window_after_account_creation(username)
-        
+
         # Check after 3 seconds if account was created
         self.root.after(3000, check_account_created)
     
