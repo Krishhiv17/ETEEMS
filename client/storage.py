@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .crypto import hkdf_derive, hmac_tag, ct_eq
 from .ratchet import DoubleRatchetState
 
 # ---------- Ratchet state helpers ----------
@@ -148,6 +149,7 @@ class Storage:
           last_rekey_at       INTEGER NOT NULL,
           ratchet_state_ct    BLOB,
           ratchet_state_nonce BLOB,
+          ratchet_state_tag   BLOB,
           ratchet_version     INTEGER DEFAULT 1
         );
         """)
@@ -162,6 +164,10 @@ class Storage:
             pass
         try:
             cur.execute("ALTER TABLE sessions ADD COLUMN ratchet_version INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("ALTER TABLE sessions ADD COLUMN ratchet_state_tag BLOB")
         except sqlite3.OperationalError:
             pass
 
@@ -181,7 +187,6 @@ class Storage:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_msgs_contact_ts ON messages(contact, ts);")
 
-        self.conn.commit()
         cur.close()
 
     # ---------- Vault / Login ----------
@@ -212,7 +217,6 @@ class Storage:
             UPDATE vault SET kek_salt=?, kek_iters=?, dek_wrapped=?, dek_nonce=?, created_at=?
             WHERE id=1
         """, (kek_salt, kek_iters, dek_wrapped, dek_nonce, _now_ts()))
-        self.conn.commit()
         cur.close()
 
         # Zeroize local KEK/DEK copies
@@ -256,11 +260,11 @@ class Storage:
         new_nonce = os.urandom(GCM_NONCE_LEN)
         new_wrapped = aesgcm2.encrypt(new_nonce, dek, AD_VAULT)
 
-        self.conn.execute("""
+        with self.conn:
+            self.conn.execute("""
             UPDATE vault SET kek_salt=?, kek_iters=?, dek_wrapped=?, dek_nonce=?, created_at=?
             WHERE id=1
         """, (new_salt, new_iters, new_wrapped, new_nonce, _now_ts()))
-        self.conn.commit()
 
         # Update in-memory
         self._zeroize(old_kek)
@@ -294,11 +298,11 @@ class Storage:
         verified: bool = False,
         remote_username: Optional[str] = None,
     ):
-        self.conn.execute("""
+        with self.conn:
+            self.conn.execute("""
             INSERT OR REPLACE INTO contacts(name, rsa_pub_pem, fingerprint, verified, added_at, remote_username)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (name, rsa_pub_pem, fingerprint, 1 if verified else 0, _now_ts(), remote_username))
-        self.conn.commit()
 
     def contact_get(self, name: str) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM contacts WHERE name=?", (name,)).fetchone()
@@ -308,15 +312,12 @@ class Storage:
 
     def contact_verify(self, name: str, verified: bool = True):
         self.conn.execute("UPDATE contacts SET verified=? WHERE name=?", (1 if verified else 0, name))
-        self.conn.commit()
 
     def contact_update_alias(self, old_name: str, new_name: str):
         self.conn.execute("UPDATE contacts SET name=? WHERE name=?", (new_name, old_name))
-        self.conn.commit()
         
     def contact_delete(self, name: str):
         self.conn.execute("DELETE FROM contacts WHERE name=?", (name,))
-        self.conn.commit()
         
     # ---------- Sessions (bundles encrypted with DEK) ----------
     
@@ -348,19 +349,22 @@ class Storage:
 
         ratchet_state_ct = None
         ratchet_state_nonce = None
+        ratchet_state_tag = None
         if ratchet_state is not None:
             ratchet_state_nonce = os.urandom(GCM_NONCE_LEN)
             ratchet_state_ct = aes.encrypt(ratchet_state_nonce, ratchet_state, AD_SESSIONS)
+            ratchet_state_tag = self._ratchet_state_tag(contact, ratchet_version, ratchet_state_nonce, ratchet_state_ct)
 
-        self.conn.execute("""
+        with self.conn:
+            self.conn.execute("""
             INSERT INTO sessions(
                 contact, session_id,
                 bundle_ab_ct, bundle_ab_nonce,
                 bundle_ba_ct, bundle_ba_nonce,
                 seq_send, seq_recv_next, last_rekey_at,
-                ratchet_state_ct, ratchet_state_nonce, ratchet_version
+                ratchet_state_ct, ratchet_state_nonce, ratchet_state_tag, ratchet_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact) DO UPDATE SET
               session_id=excluded.session_id,
               bundle_ab_ct=excluded.bundle_ab_ct,
@@ -372,20 +376,21 @@ class Storage:
               last_rekey_at=excluded.last_rekey_at,
               ratchet_state_ct=excluded.ratchet_state_ct,
               ratchet_state_nonce=excluded.ratchet_state_nonce,
+              ratchet_state_tag=excluded.ratchet_state_tag,
               ratchet_version=excluded.ratchet_version
-        """, (contact, session_id, ab_ct, ab_nonce, ba_ct, ba_nonce, seq_send, seq_recv_next, last_rekey_at, ratchet_state_ct, ratchet_state_nonce, ratchet_version))
-        self.conn.commit()
+        """, (contact, session_id, ab_ct, ab_nonce, ba_ct, ba_nonce, seq_send, seq_recv_next, last_rekey_at, ratchet_state_ct, ratchet_state_nonce, ratchet_state_tag, ratchet_version))
         
     def session_update_ratchet_state(self, contact: str, ratchet_state: bytes, ratchet_version: int = 2):
         self._require_unlocked()
         aes = AESGCM(self._dek)
         nonce = os.urandom(GCM_NONCE_LEN)
         ct = aes.encrypt(nonce, ratchet_state, AD_SESSIONS)
-        self.conn.execute(
-            "UPDATE sessions SET ratchet_state_ct=?, ratchet_state_nonce=?, ratchet_version=? WHERE contact=?",
-            (ct, nonce, ratchet_version, contact),
-        )
-        self.conn.commit()
+        tag = self._ratchet_state_tag(contact, ratchet_version, nonce, ct)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET ratchet_state_ct=?, ratchet_state_nonce=?, ratchet_state_tag=?, ratchet_version=? WHERE contact=?",
+                (ct, nonce, tag, ratchet_version, contact),
+            )
 
     def session_get(self, contact: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute("SELECT * FROM sessions WHERE contact=?", (contact,)).fetchone()
@@ -407,6 +412,10 @@ class Storage:
             result["bundle_ab"] = _deserialize_bundle(ab_bytes)
             result["bundle_ba"] = _deserialize_bundle(ba_bytes)
             if row["ratchet_state_ct"] is not None and row["ratchet_state_nonce"] is not None:
+                if row["ratchet_state_tag"] is not None:
+                    exp = self._ratchet_state_tag(contact, result["ratchet_version"], row["ratchet_state_nonce"], row["ratchet_state_ct"])
+                    if not ct_eq(exp, row["ratchet_state_tag"]):
+                        raise RuntimeError("Ratchet state integrity check failed")
                 rs_bytes = aes.decrypt(row["ratchet_state_nonce"], row["ratchet_state_ct"], AD_SESSIONS)
                 result["ratchet_state"] = rs_bytes
             else:
@@ -426,7 +435,6 @@ class Storage:
     def seq_inc_send(self, contact: str) -> int:
         cur = self.conn.cursor()
         cur.execute("UPDATE sessions SET seq_send = seq_send + 1 WHERE contact=?", (contact,))
-        self.conn.commit()
         new = cur.execute("SELECT seq_send FROM sessions WHERE contact=?", (contact,)).fetchone()
         cur.close()
         return int(new["seq_send"])
@@ -439,7 +447,6 @@ class Storage:
 
     def seq_set_recv_next(self, contact: str, val: int):
         self.conn.execute("UPDATE sessions SET seq_recv_next=? WHERE contact=?", (val, contact))
-        self.conn.commit()
         
     # ---------- Messages (store plaintext or encrypt body) ----------
     
@@ -454,20 +461,21 @@ class Storage:
     ):
         ts = _now_ts()
         if not encrypt_body:
-            self.conn.execute("""
-                INSERT INTO messages(contact, direction, ts, remote_id, session_epoch, plaintext)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (contact, direction, ts, remote_id, session_epoch, plaintext.decode("utf-8", errors="replace")))
+            with self.conn:
+                self.conn.execute("""
+                    INSERT INTO messages(contact, direction, ts, remote_id, session_epoch, plaintext)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (contact, direction, ts, remote_id, session_epoch, plaintext.decode("utf-8", errors="replace")))
         else:
             self._require_unlocked()
             aes = AESGCM(self._dek)
             nonce = os.urandom(GCM_NONCE_LEN)
             ct = aes.encrypt(nonce, plaintext, AD_MESSAGES)
-            self.conn.execute("""
-                INSERT INTO messages(contact, direction, ts, remote_id, session_epoch, body_ct, body_nonce)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (contact, direction, ts, remote_id, session_epoch, ct, nonce))
-        self.conn.commit()
+            with self.conn:
+                self.conn.execute("""
+                    INSERT INTO messages(contact, direction, ts, remote_id, session_epoch, body_ct, body_nonce)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (contact, direction, ts, remote_id, session_epoch, ct, nonce))
         
     def messages_list(self, contact: str, limit: int = 100, decrypt_bodies: bool = True) -> list[Dict[str, Any]]:
         rows = self.conn.execute("""
@@ -492,7 +500,13 @@ class Storage:
     
 
     # ---------- Internals ----------
-    
+
+    def _ratchet_state_tag(self, contact: str, ratchet_version: int, nonce: bytes, ct: bytes) -> bytes:
+        self._require_unlocked()
+        key = hkdf_derive(self._dek, info=b"ratchet-state-hmac", length=32, salt=b"")
+        data = contact.encode("utf-8") + b"|" + str(ratchet_version).encode("ascii") + b"|" + nonce + ct
+        return hmac_tag(key, data)
+
     def _derive_kek(self, passphrase: str, salt: bytes, iters: int) -> bytes:
         kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=KDF_KEY_LEN, salt=salt, iterations=iters)
         return kdf.derive(passphrase.encode("utf-8"))

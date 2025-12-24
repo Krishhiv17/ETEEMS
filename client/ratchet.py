@@ -1,9 +1,15 @@
 from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from client.crypto import hkdf_derive, dh_gen, dh_shared
+
+# Bound skipped-message storage and skip window to reduce DoS risk.
+MAX_SKIP = 2000
+MAX_SKIP_KEYS = 2000
+# Trigger a DH ratchet every N sent messages (no protocol change).
+DH_RATCHET_INTERVAL = 50
 
 
 def _b64e(b: bytes) -> str:
@@ -53,6 +59,7 @@ class DoubleRatchetState:
     dh_sending_pub: Optional[int] = None
     dh_receiving_pub: Optional[int] = None
     skipped_message_keys: Dict[str, str] = field(default_factory=dict)
+    skipped_message_keys_order: List[str] = field(default_factory=list)
     send_dh: bool = False
 
     def to_dict(self) -> dict:
@@ -67,6 +74,7 @@ class DoubleRatchetState:
             "dh_sending_pub": self.dh_sending_pub,
             "dh_receiving_pub": self.dh_receiving_pub,
             "skipped_message_keys": self.skipped_message_keys,
+            "skipped_message_keys_order": self.skipped_message_keys_order,
             "send_dh": self.send_dh,
         }
 
@@ -83,6 +91,7 @@ class DoubleRatchetState:
             dh_sending_pub=obj.get("dh_sending_pub"),
             dh_receiving_pub=obj.get("dh_receiving_pub"),
             skipped_message_keys=dict(obj.get("skipped_message_keys", {})),
+            skipped_message_keys_order=list(obj.get("skipped_message_keys_order", [])),
             send_dh=bool(obj.get("send_dh", False)),
         )
 
@@ -105,14 +114,25 @@ class DoubleRatchet:
         )
         return DoubleRatchet(state)
 
+    def _store_skipped_key(self, key_id: str, mk: bytes) -> None:
+        if key_id in self.state.skipped_message_keys:
+            return
+        self.state.skipped_message_keys[key_id] = _b64e(mk)
+        self.state.skipped_message_keys_order.append(key_id)
+        if len(self.state.skipped_message_keys_order) > MAX_SKIP_KEYS:
+            oldest = self.state.skipped_message_keys_order.pop(0)
+            self.state.skipped_message_keys.pop(oldest, None)
+
     def _skip_message_keys(self, until: int) -> None:
         if self.state.receiving_chain_key is None:
             return
+        if until - self.state.recv_msg_num > MAX_SKIP:
+            raise RuntimeError("Too many skipped messages")
         while self.state.recv_msg_num < until:
             ck, mk = hkdf_chain_key_step(self.state.receiving_chain_key)
             self.state.receiving_chain_key = ck
             key_id = f"{self.state.dh_receiving_pub}:{self.state.recv_msg_num}"
-            self.state.skipped_message_keys[key_id] = _b64e(mk)
+            self._store_skipped_key(key_id, mk)
             self.state.recv_msg_num += 1
 
     def _dh_ratchet(self, new_peer_pub: int) -> None:
@@ -127,6 +147,10 @@ class DoubleRatchet:
         self.state.send_dh = True
 
     def ratchet_encrypt(self, plaintext: bytes) -> Tuple[dict, Dict[str, bytes]]:
+        if not self.state.send_dh and DH_RATCHET_INTERVAL and self.state.send_msg_num > 0:
+            if (self.state.send_msg_num % DH_RATCHET_INTERVAL) == 0:
+                self.state.send_dh = True
+
         if self.state.send_dh:
             priv, pub = dh_gen()
             self.state.dh_sending_priv = priv
@@ -163,7 +187,14 @@ class DoubleRatchet:
         key_id = f"{self.state.dh_receiving_pub}:{msg_num}"
         if key_id in self.state.skipped_message_keys:
             mk = _b64d(self.state.skipped_message_keys.pop(key_id))
+            try:
+                self.state.skipped_message_keys_order.remove(key_id)
+            except ValueError:
+                pass
             return mk
+
+        if msg_num < self.state.recv_msg_num:
+            raise RuntimeError("Replay or old message")
 
         self._skip_message_keys(msg_num)
         if self.state.receiving_chain_key is None:

@@ -6,7 +6,7 @@ from client.transport import Transport
 from client.storage import Storage, serialize_ratchet_state, deserialize_ratchet_state
 from client.framing import (
     build_frame, parse_and_verify_frame,
-    build_ratchet_frame, parse_and_verify_ratchet_frame, parse_ratchet_header, RATCHET_VERSION,
+    build_ratchet_frame, parse_and_verify_ratchet_frame, parse_ratchet_header, RATCHET_VERSION, FRAME_VERSION,
     BadTag, ReplayError, OutOfOrderError, ShortFrame,
 )
 from client.crypto import hkdf_derive, dh_gen, dh_shared
@@ -18,6 +18,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 # ---------- simple helpers ----------
 
 DATA_DIR = os.path.expanduser("~/.e2e")
+IN_RATE_WINDOW = 10.0
+IN_RATE_MAX = 200
 
 def b64e(b: bytes) -> str: return base64.b64encode(b).decode("ascii")
 def b64d(s: str) -> bytes: return base64.b64decode(s.encode("ascii"))
@@ -233,6 +235,20 @@ class ClientRuntime:
         self._session_establishing: set[str] = set()
         self._dh_pending: Dict[str, tuple[int, int, int, str]] = {}
         self._event_listeners: List[Callable[[dict], None]] = []
+        self._recv_rate: Dict[str, deque[float]] = {}
+
+    def _frame_ad(self, sender: str, receiver: str, session_id: int, version: int) -> bytes:
+        return f"ad|{sender}|{receiver}|{session_id}|v{version}".encode("utf-8")
+
+    def _allow_incoming(self, remote_username: str) -> bool:
+        now = time.time()
+        q = self._recv_rate.setdefault(remote_username, deque())
+        while q and now - q[0] > IN_RATE_WINDOW:
+            q.popleft()
+        if len(q) >= IN_RATE_MAX:
+            return False
+        q.append(now)
+        return True
 
     @staticmethod
     def check_account_exists(username: str) -> bool:
@@ -406,12 +422,15 @@ class ClientRuntime:
             ratchet = DoubleRatchet(state)
             header, mk_bundle = ratchet.ratchet_encrypt(pt)
             keys = derive_message_keys(mk_bundle["message_key"])
+            self.storage._zeroize(mk_bundle["message_key"])
+            ad = self._frame_ad(self.username, remote_username, sid, RATCHET_VERSION)
             frame = build_ratchet_frame(
                 keys,
                 msg_num=int(header["msg_num"]),
                 prev_chain_len=int(header["prev_chain_len"]),
                 plaintext=pt,
                 dh_pub=header.get("dh_pub"),
+                ad=ad,
             )
             await self.transport.send_frame(remote_username, sid, frame)
             db_store_message(self.storage, alias, "out", sid, int(header["msg_num"]), pt)
@@ -432,7 +451,8 @@ class ClientRuntime:
             return
         seq = int(sess["seq_send"])
         keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
-        frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
+        ad = self._frame_ad(self.username, remote_username, sid, FRAME_VERSION)
+        frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt, ad=ad)
         await self.transport.send_frame(remote_username, sid, frame)
         db_store_message(self.storage, alias, "out", sid, seq, pt)
         db_bump_seq_send(self.storage, alias, seq + 1)
@@ -464,12 +484,15 @@ class ClientRuntime:
                 pt = text.encode("utf-8")
                 header, mk_bundle = ratchet.ratchet_encrypt(pt)
                 keys = derive_message_keys(mk_bundle["message_key"])
+                self.storage._zeroize(mk_bundle["message_key"])
+                ad = self._frame_ad(self.username, remote_username, sid, RATCHET_VERSION)
                 frame = build_ratchet_frame(
                     keys,
                     msg_num=int(header["msg_num"]),
                     prev_chain_len=int(header["prev_chain_len"]),
                     plaintext=pt,
                     dh_pub=header.get("dh_pub"),
+                    ad=ad,
                 )
                 try:
                     await self.transport.send_frame(remote_username, sid, frame)
@@ -496,7 +519,8 @@ class ClientRuntime:
         keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
         for idx, text in enumerate(pending):
             pt = text.encode("utf-8")
-            frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
+            ad = self._frame_ad(self.username, remote_username, sid, FRAME_VERSION)
+            frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt, ad=ad)
             try:
                 await self.transport.send_frame(remote_username, sid, frame)
             except Exception:
@@ -549,6 +573,9 @@ class ClientRuntime:
                 return
 
             alias = self._alias_for_remote(from_user)
+        if not self._allow_incoming(from_user):
+            print(f"[recv] rate limit from {from_user}; dropping")
+            return
             if alias is None:
                 alias = pending_alias or from_user
                 if pending_alias is None:
@@ -642,6 +669,9 @@ class ClientRuntime:
                 restore_prompt = False
 
         alias = self._alias_for_remote(from_user) or from_user
+        if not self._allow_incoming(from_user):
+            print(f"[recv] rate limit from {from_user}; dropping")
+            return
         sess = db_get_session(self.storage, alias)
         if not sess or int(sess["session_id"]) != int(session_id):
             print(f"[recv] unknown session from={from_user} sid={session_id}")
@@ -653,7 +683,9 @@ class ClientRuntime:
                 ratchet = DoubleRatchet(state)
                 mk = ratchet.ratchet_decrypt(header)
                 keys = derive_message_keys(mk)
-                header2, pt = parse_and_verify_ratchet_frame(keys, frame)
+                self.storage._zeroize(mk)
+                ad = self._frame_ad(from_user, self.username, session_id, RATCHET_VERSION)
+                header2, pt = parse_and_verify_ratchet_frame(keys, frame, ad=ad)
                 seq = int(header2["msg_num"])
             except BadTag:
                 print(f"[recv] BAD TAG from {from_user} (tampered?)")
@@ -691,7 +723,8 @@ class ClientRuntime:
             keys = {"K_enc": sess["k_enc_ba"], "K_mac": sess["k_mac_ba"], "IVseed": sess["ivseed_ba"]}
 
             try:
-                (_v,_f,_sid, seq), pt = parse_and_verify_frame(keys, frame, expected_session_id=session_id, expected_seq=expected)
+                ad = self._frame_ad(from_user, self.username, session_id, FRAME_VERSION)
+                (_v,_f,_sid, seq), pt = parse_and_verify_frame(keys, frame, expected_session_id=session_id, expected_seq=expected, ad=ad)
             except ReplayError:
                 print(f"[recv] replay from {from_user} (ignored)")
                 return
@@ -999,6 +1032,9 @@ class ClientRuntime:
 
     async def _handle_friend_remove(self, from_user: str) -> None:
         alias = self._alias_for_remote(from_user)
+        if not self._allow_incoming(from_user):
+            print(f"[recv] rate limit from {from_user}; dropping")
+            return
         if not alias:
             print(f"[friend] {from_user} removed you, but no local contact entry found.")
             return

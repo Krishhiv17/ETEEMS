@@ -111,6 +111,7 @@ def build_frame(
             seq: int,
             plaintext: bytes,
             flags: int = FLAG_MODE_CTR,
+            ad: bytes = b"",
         ) -> bytes:
     """
     Build a full EtM frame for a single message (sender → receiver direction).
@@ -127,7 +128,7 @@ def build_frame(
     header = pack_header(flags=flags, session_id=session_id, seq=seq)
     iv = derive_iv(keys_dir["IVseed"], seq)
     ct = aes_ctr_encrypt(keys_dir["K_enc"], iv, plaintext)
-    tag = hmac_tag(keys_dir["K_mac"], header + iv + ct)
+    tag = hmac_tag(keys_dir["K_mac"], header + iv + ct + ad)
     frame = header + iv + ct + tag
     if len(frame) > MAX_FRAME_LEN:
         raise OversizedFrame(f"frame length {len(frame)} > MAX_FRAME_LEN {MAX_FRAME_LEN}")
@@ -139,6 +140,7 @@ def parse_and_verify_frame(
     expected_session_id: int,
     expected_seq: int,
     drop_out_of_order: bool = True,
+    ad: bytes = b"",
 ) -> tuple[tuple[int, int, int, int], bytes]:
     """
     Verify & decrypt a received frame (receiver path).
@@ -170,7 +172,7 @@ def parse_and_verify_frame(
     ct = frame[HEADER_LEN + IV_LEN : -TAG_LEN]
 
     # MAC verify first (EtM)
-    exp = hmac_tag(keys_dir["K_mac"], header + iv + ct)
+    exp = hmac_tag(keys_dir["K_mac"], header + iv + ct + ad)
     if not ct_eq(exp, tag):
         raise BadTag("HMAC verification failed")
 
@@ -197,6 +199,7 @@ def build_ratchet_frame(
     prev_chain_len: int,
     plaintext: bytes,
     dh_pub: int | None = None,
+    ad: bytes = b"",
 ) -> bytes:
     if plaintext is None:
         plaintext = b''
@@ -205,7 +208,7 @@ def build_ratchet_frame(
     header = _RATCHET_HDR_STRUCT.pack(RATCHET_VERSION, flags, prev_chain_len, msg_num, len(dh_bytes)) + dh_bytes
     iv = derive_iv(keys_dir['IVseed'], msg_num)
     ct = aes_ctr_encrypt(keys_dir['K_enc'], iv, plaintext)
-    tag = hmac_tag(keys_dir['K_mac'], header + iv + ct)
+    tag = hmac_tag(keys_dir['K_mac'], header + iv + ct + ad)
     frame = header + iv + ct + tag
     if len(frame) > MAX_FRAME_LEN:
         raise OversizedFrame(f'frame length {len(frame)} > MAX_FRAME_LEN {MAX_FRAME_LEN}')
@@ -215,6 +218,7 @@ def build_ratchet_frame(
 def parse_and_verify_ratchet_frame(
     keys_dir: dict[str, bytes],
     frame: bytes,
+    ad: bytes = b"",
 ) -> tuple[dict, bytes]:
     if frame is None:
         raise ShortFrame('empty frame')
@@ -237,7 +241,7 @@ def parse_and_verify_ratchet_frame(
     iv = frame[off:off+IV_LEN]
     tag = frame[-TAG_LEN:]
     ct = frame[off+IV_LEN:-TAG_LEN]
-    exp = hmac_tag(keys_dir['K_mac'], frame[:off] + iv + ct)
+    exp = hmac_tag(keys_dir['K_mac'], frame[:off] + iv + ct + ad)
     if not ct_eq(exp, tag):
         raise BadTag('HMAC verification failed')
     pt = aes_ctr_decrypt(keys_dir['K_enc'], iv, ct)
