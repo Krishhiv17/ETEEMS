@@ -273,6 +273,9 @@ class ClientGUI:
         self.chat_active_alias: Optional[str] = None
         self._listener_registered = False
         self.friend_lookup: dict[str, dict] = {}
+        self._pending_incoming: dict[str, dict[tuple[int, int], dict]] = {}
+        self._friends_sig: Optional[tuple] = None
+        self._online_sig: Optional[tuple] = None
         
         # Authentication state
         self._current_window: Optional[tk.Widget] = None
@@ -448,11 +451,19 @@ class ClientGUI:
         if self.loop_thread is None:
             self.loop_thread = threading.Thread(target=self._run_loop, daemon=True)
             self.loop_thread.start()
+        self._pending_username = username
         future = asyncio.run_coroutine_threadsafe(
             self._init_client(username, passphrase, is_new_account=False),
             self.loop
         )
-        future.add_done_callback(lambda fut: self.root.after(0, self._handle_connect_result, fut))
+
+        def check_future() -> None:
+            if future.done():
+                self._handle_connect_result(future)
+                return
+            self.root.after(100, check_future)
+
+        self.root.after(100, check_future)
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -614,7 +625,20 @@ class ClientGUI:
         if not self.client:
             return
         future = asyncio.run_coroutine_threadsafe(self.client.list_contacts(), self.loop)
-        future.add_done_callback(lambda fut: self.root.after(0, self._update_friends_from_future, fut))
+
+        def check_future() -> None:
+            if future.done():
+                self._update_friends_from_future(future)
+                return
+            self.root.after(100, check_future)
+
+        self.root.after(100, check_future)
+
+    def _friends_signature(self, friends: list[dict]) -> tuple:
+        return tuple(
+            (f.get("alias"), f.get("remote_username"), bool(f.get("verified")), f.get("fingerprint"))
+            for f in friends
+        )
 
     def _update_friends_from_future(self, fut: asyncio.Future) -> None:
         if not self.connected:
@@ -624,6 +648,10 @@ class ClientGUI:
         except Exception as exc:
             self.status_var.set(f"Friend list error: {exc}")
             return
+        sig = self._friends_signature(friends)
+        if sig == self._friends_sig:
+            return
+        self._friends_sig = sig
         self.friends = friends
         self.friend_lookup = {f["alias"]: f for f in friends}
         self._render_friend_list()
@@ -633,7 +661,17 @@ class ClientGUI:
             return
         self._online_request_active = True
         future = asyncio.run_coroutine_threadsafe(self.client.get_online_users(), self.loop)
-        future.add_done_callback(lambda fut: self.root.after(0, self._handle_online_result, fut))
+
+        def check_future() -> None:
+            if future.done():
+                self._handle_online_result(future)
+                return
+            self.root.after(100, check_future)
+
+        self.root.after(100, check_future)
+
+    def _online_signature(self, users: list[dict]) -> tuple:
+        return tuple((u.get("user"), u.get("fingerprint")) for u in users)
 
     def _handle_online_result(self, fut: asyncio.Future) -> None:
         self._online_request_active = False
@@ -644,6 +682,10 @@ class ClientGUI:
         except Exception as exc:
             self.status_var.set(f"Online query error: {exc}")
             return
+        sig = self._online_signature(users)
+        if sig == self._online_sig:
+            return
+        self._online_sig = sig
         self.online_users = users
         self._render_online_list()
         self._render_friend_list()
@@ -676,10 +718,6 @@ class ClientGUI:
             if not friend["verified"]:
                 open_btn.state(["disabled"])
             open_btn.pack(side="right", padx=(4, 0))
-            request_btn = ttk.Button(button_box, text="Send Chat Request", command=lambda a=alias: self.request_chat(a))
-            if not friend["verified"]:
-                request_btn.state(["disabled"])
-            request_btn.pack(side="right", padx=(4, 0))
 
     def _render_online_list(self) -> None:
         if not hasattr(self, 'online_container') or self.online_container is None:
@@ -712,24 +750,6 @@ class ClientGUI:
                     text="Send Friend Request",
                     command=lambda u=user: self.send_friend_request_online(u),
                 ).pack(side="right")
-
-    def request_chat(self, alias: str) -> None:
-        if not self.client:
-            return
-        future = asyncio.run_coroutine_threadsafe(self.client.send_chat_request_feedback(alias), self.loop)
-        future.add_done_callback(lambda fut, name=alias: self.root.after(0, self._handle_chat_feedback, name, fut))
-
-    def _handle_chat_feedback(self, alias: str, fut: asyncio.Future) -> None:
-        try:
-            success, message = fut.result()
-        except Exception as exc:
-            messagebox.showerror("Chat request", f"Failed to contact {alias}: {exc}")
-            return
-        self.status_var.set(message)
-        if success:
-            messagebox.showinfo("Chat request", message)
-        else:
-            messagebox.showwarning("Chat request", message)
 
     def remove_friend_gui(self, alias: str) -> None:
         if not self.client:
@@ -766,6 +786,10 @@ class ClientGUI:
         self.chat_title.set(f"Chat with {alias}")
         self._update_chat_controls(enabled=True)
         self._load_chat_history(alias)
+        future = asyncio.run_coroutine_threadsafe(self.client.open_chat(alias), self.loop)
+        future.add_done_callback(
+            lambda fut, name=alias: self.root.after(0, self._handle_future_error, fut, f"open chat with {name}")
+        )
         if focus:
             self.chat_entry.focus_set()
 
@@ -774,7 +798,14 @@ class ClientGUI:
             return
         self._set_chat_text("")
         future = asyncio.run_coroutine_threadsafe(self.client.list_messages(alias, limit=200), self.loop)
-        future.add_done_callback(lambda fut, name=alias: self.root.after(0, self._populate_chat_history, name, fut))
+
+        def check_future() -> None:
+            if future.done():
+                self._populate_chat_history(alias, future)
+                return
+            self.root.after(100, check_future)
+
+        self.root.after(100, check_future)
 
     def _populate_chat_history(self, alias: str, fut: asyncio.Future) -> None:
         if alias != self.chat_active_alias:
@@ -785,6 +816,7 @@ class ClientGUI:
             self.status_var.set(f"History error: {exc}")
             return
         lines = []
+        seen = set()
         for entry in messages:
             text = entry.get("text") or ""
             if entry.get("direction") == "out":
@@ -792,6 +824,26 @@ class ClientGUI:
             else:
                 prefix = alias
             lines.append(f"{prefix}: {text}")
+            sess = entry.get("session_epoch")
+            rid = entry.get("remote_id")
+            if sess is not None and rid is not None:
+                try:
+                    seen.add((int(sess), int(rid)))
+                except Exception:
+                    pass
+        pending = self._pending_incoming.pop(alias, {})
+        remote_key = None
+        if hasattr(self, 'friend_lookup') and alias in self.friend_lookup:
+            remote_key = self.friend_lookup[alias].get("remote_username")
+        if remote_key and remote_key != alias:
+            pending.update(self._pending_incoming.pop(remote_key, {}))
+        for key, pdata in pending.items():
+            if key in seen:
+                continue
+            p_text = pdata.get("text") or ""
+            p_dir = pdata.get("direction", "in")
+            prefix = "You" if p_dir == "out" else alias
+            lines.append(f"{prefix}: {p_text}")
         self._set_chat_text("\n".join(lines) + ("\n" if lines else ""))
 
     def send_chat_message(self, event: Optional[tk.Event] = None) -> None:
@@ -821,11 +873,25 @@ class ClientGUI:
         else:
             self.status_var.set("Friend removal failed; check console.")
 
-    def _append_chat_line(self, alias: str, direction: str, text: str) -> None:
+    def _append_chat_line(
+        self,
+        alias: str,
+        direction: str,
+        text: str,
+        session_id: Optional[int] = None,
+        seq: Optional[int] = None,
+        remote: Optional[str] = None,
+    ) -> None:
         if not hasattr(self, 'chat_text') or self.chat_text is None:
             return
         if alias != self.chat_active_alias:
             self.status_var.set(f"New message from {alias}")
+            if session_id is not None and seq is not None:
+                pending = self._pending_incoming.setdefault(alias, {})
+                pending[(session_id, seq)] = {"direction": direction, "text": text}
+                if remote and remote != alias:
+                    alt = self._pending_incoming.setdefault(remote, {})
+                    alt[(session_id, seq)] = {"direction": direction, "text": text}
             return
         prefix = "You" if direction == "out" else alias
         line = f"{prefix}: {text}"
@@ -869,19 +935,7 @@ class ClientGUI:
         if not self.client:
             return
         etype = event.get("type")
-        if etype == "chat_request":
-            alias = event.get("alias")
-            remote = event.get("remote")
-            if alias:
-                self.status_var.set(f"Chat request from {alias}")
-            if remote:
-                accept = messagebox.askyesno("Chat request", f"{alias} wants to start a chat. Accept?")
-                future = asyncio.run_coroutine_threadsafe(
-                    self.client.respond_chat_request(remote, accept),
-                    self.loop,
-                )
-                future.add_done_callback(lambda fut: self.root.after(0, self._handle_future_error, fut, "chat response"))
-        elif etype == "friend_request":
+        if etype == "friend_request":
             remote = event.get("remote")
             if not remote:
                 return
@@ -945,17 +999,6 @@ class ClientGUI:
                 self._update_chat_controls(False)
             self.refresh_friend_list()
             self.refresh_online_list()
-        elif etype == "chat_started":
-            alias = event.get("alias")
-            if alias:
-                self.status_var.set(f"Chat active with {alias}")
-                self.open_chat(alias, focus=True)
-                self.refresh_friend_list()
-        elif etype == "chat_declined":
-            alias = event.get("alias")
-            if alias:
-                self.status_var.set(f"{alias} declined the chat request.")
-                self.refresh_friend_list()
         elif etype == "contact_unverified":
             alias = event.get("alias")
             if alias:
@@ -963,9 +1006,13 @@ class ClientGUI:
             self.refresh_friend_list()
         elif etype == "message":
             alias = event.get("alias")
+            remote = event.get("remote")
             text = event.get("text") or ""
             direction = event.get("direction", "in")
-            self._append_chat_line(alias or "Unknown", direction, text)
+            session_id = event.get("session_id")
+            seq = event.get("seq")
+            label = alias or remote or "Unknown"
+            self._append_chat_line(label, direction, text, session_id=session_id, seq=seq, remote=remote)
 
     def _handle_future_error(self, fut: asyncio.Future, context: str) -> None:
         try:

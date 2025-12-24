@@ -221,8 +221,9 @@ class ClientRuntime:
         self._pending_prompts: deque[dict] = deque()
         self._active_prompt: Optional[dict] = None
         self._pending_friend_outgoing: Dict[str, str] = {}
-        self._pending_chat_outgoing: Dict[str, str] = {}
         self.active_contact: Optional[str] = None
+        self._pending_messages: Dict[str, list[str]] = {}
+        self._session_establishing: set[str] = set()
         self._dh_pending: Dict[str, tuple[int, int, int, str]] = {}
         self._event_listeners: List[Callable[[dict], None]] = []
 
@@ -382,15 +383,15 @@ class ClientRuntime:
         remote_username = row["remote_username"] or alias
         sess = db_get_session(self.storage, alias)
         if not sess:
-            await self.start_session_with(alias, remote_username)
-            for _ in range(50):
-                await asyncio.sleep(0.1)
-                sess = db_get_session(self.storage, alias)
-                if sess:
-                    break
-            if not sess:
-                print(f"[send] waiting for secure session with {alias}; try again shortly")
-                return
+            self._pending_messages.setdefault(alias, []).append(text)
+            if alias not in self._session_establishing:
+                self._session_establishing.add(alias)
+                await self.start_session_with(alias, remote_username)
+            print(f"[send] establishing secure session with {alias}...")
+            return
+        await self._send_text_with_session(alias, remote_username, sess, text)
+
+    async def _send_text_with_session(self, alias: str, remote_username: str, sess: dict, text: str) -> None:
         seq = int(sess["seq_send"])
         keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
         sid = int(sess["session_id"])
@@ -410,6 +411,39 @@ class ClientRuntime:
             "seq": seq,
         })
 
+    async def _flush_pending_messages(self, alias: str, remote_username: str) -> None:
+        pending = self._pending_messages.pop(alias, [])
+        self._session_establishing.discard(alias)
+        if not pending:
+            return
+        sess = db_get_session(self.storage, alias)
+        if not sess:
+            self._pending_messages.setdefault(alias, []).extend(pending)
+            return
+        seq = int(sess["seq_send"])
+        keys = {"K_enc": sess["k_enc_ab"], "K_mac": sess["k_mac_ab"], "IVseed": sess["ivseed_ab"]}
+        sid = int(sess["session_id"])
+        for idx, text in enumerate(pending):
+            pt = text.encode("utf-8")
+            frame = build_frame(keys, session_id=sid, seq=seq, plaintext=pt)
+            try:
+                await self.transport.send_frame(remote_username, sid, frame)
+            except Exception:
+                self._pending_messages.setdefault(alias, []).extend(pending[idx:])
+                raise
+            db_store_message(self.storage, alias, "out", sid, seq, pt)
+            db_bump_seq_send(self.storage, alias, seq + 1)
+            self._notify_event({
+                "type": "message",
+                "alias": alias,
+                "remote": remote_username,
+                "direction": "out",
+                "text": text,
+                "session_id": sid,
+                "seq": seq,
+            })
+            seq += 1
+
     # ----- receive hooks from Transport -----
 
     async def _on_session(self, from_user: str, payload: bytes):
@@ -425,12 +459,6 @@ class ClientRuntime:
             return
         if t == "friend_resp":
             await self._handle_friend_response(from_user, obj)
-            return
-        if t == "chat_req":
-            await self._handle_chat_request(from_user, obj)
-            return
-        if t == "chat_resp":
-            await self._handle_chat_response(from_user, obj)
             return
         if t == "friend_remove":
             await self._handle_friend_remove(from_user)
@@ -480,6 +508,7 @@ class ClientRuntime:
             if not self.active_contact:
                 self.active_contact = alias
             print(f"[session:resp] to={alias} sid={sid}, derived keys; sent B ({B.bit_length()} bits)")
+            await self._flush_pending_messages(alias, from_user)
             return
 
         if t == "resp":
@@ -504,6 +533,7 @@ class ClientRuntime:
             )
             self.active_contact = alias
             print(f"[session:init→ready] with {alias} sid={sid}, keys installed")
+            await self._flush_pending_messages(alias, from_user)
             return
 
         print(f"[session] unknown type from {from_user}: {t}")
@@ -842,7 +872,6 @@ class ClientRuntime:
             return
         self.storage.contact_delete(alias)
         self._pending_friend_outgoing.pop(from_user, None)
-        self._pending_chat_outgoing.pop(from_user, None)
         if self.active_contact == alias:
             self.active_contact = None
         print(f"[friend] {alias} removed you from their contacts.")
@@ -851,50 +880,6 @@ class ClientRuntime:
             "remote": from_user,
             "alias": alias,
         })
-
-    async def _handle_chat_request(self, from_user: str, obj: dict) -> None:
-        row_obj = self.storage.contact_get_by_remote(from_user)
-        row = dict(row_obj) if row_obj else None
-        if not row or not row.get("verified"):
-            await self._send_control(from_user, {"t": "chat_resp", "status": "reject"})
-            print(f"[chat] Ignored chat request from {from_user}; not in friends list.")
-            return
-        alias = row["name"]
-        self._notify_event({
-            "type": "chat_request",
-            "remote": from_user,
-            "alias": alias,
-        })
-        prompt = {
-            "type": "chat_confirm",
-            "remote": from_user,
-            "alias": alias,
-        }
-        self._pending_prompts.append(prompt)
-        await self._maybe_show_prompt()
-
-    async def _handle_chat_response(self, from_user: str, obj: dict) -> None:
-        alias = self._pending_chat_outgoing.pop(from_user, None)
-        status = obj.get("status")
-        if status != "accept":
-            print(f"[chat] {from_user} declined your chat request.")
-            self._notify_event({
-                "type": "chat_declined",
-                "remote": from_user,
-                "alias": alias or self._alias_for_remote(from_user) or from_user,
-            })
-            return
-        if alias is None:
-            alias = self._alias_for_remote(from_user) or from_user
-        print(f"[chat] {from_user} accepted. Establishing secure session...")
-        await self.start_session_with(alias, from_user, force=True)
-        self.active_contact = alias
-        self._notify_event({
-            "type": "chat_started",
-            "remote": from_user,
-            "alias": alias,
-        })
-
 
     async def _accept_friend(self, remote_username: str, alias: str, pem: bytes) -> None:
         await self._ensure_contact_alias(alias, remote_username, True, pem=pem)
@@ -913,8 +898,6 @@ class ClientRuntime:
             default_alias = prompt.get("default_alias", prompt["remote"])
             prompt["default_alias"] = default_alias
             print(f"[friend] Enter a name to display for {prompt['remote']} (default: {default_alias}): ", end="", flush=True)
-        elif p_type == "chat_confirm":
-            print(f"[chat] {prompt['alias']} wants to start a chat. Accept? (Y/n): ", end="", flush=True)
 
     async def handle_prompt_input(self, line: str) -> bool:
         if not self._active_prompt:
@@ -962,32 +945,7 @@ class ClientRuntime:
             })
             await self._maybe_show_prompt()
             return True
-        if p_type == "chat_confirm":
-            accepted = response in ("", "y", "yes")
-            if accepted:
-                self.active_contact = prompt["alias"]
-                await self._handle_chat_response_local(prompt["remote"], True)
-                print(f"[chat] Accepted chat with {prompt['alias']}.")
-                self._notify_event({
-                    "type": "chat_started",
-                    "remote": prompt["remote"],
-                    "alias": prompt["alias"],
-                })
-            else:
-                await self._handle_chat_response_local(prompt["remote"], False)
-                print(f"[chat] Declined chat with {prompt['alias']}.")
-                self._notify_event({
-                    "type": "chat_declined",
-                    "remote": prompt["remote"],
-                    "alias": prompt["alias"],
-                })
-            await self._maybe_show_prompt()
-            return True
         return False
-
-    async def _handle_chat_response_local(self, from_user: str, accepted: bool) -> None:
-        status = "accept" if accepted else "reject"
-        await self._send_control(from_user, {"t": "chat_resp", "status": status})
 
     async def show_online(self) -> None:
         if not self.transport:
@@ -1071,7 +1029,6 @@ class ClientRuntime:
         remote_username = row["remote_username"] or alias
         self.storage.contact_delete(alias)
         self._pending_friend_outgoing.pop(remote_username, None)
-        self._pending_chat_outgoing.pop(remote_username, None)
         fut = self._pending_pubkeys.pop(remote_username, None)
         if fut and not fut.done():
             fut.cancel()
@@ -1089,52 +1046,6 @@ class ClientRuntime:
         except Exception:
             pass
         return True
-
-    async def _send_chat_request_common(self, alias: str) -> tuple[bool, str]:
-        alias = alias.strip()
-        if not alias:
-            return False, "[chat] usage: /chat <alias>"
-        row_obj = self.storage.contact_get(alias)
-        row = dict(row_obj) if row_obj else None
-        if not row or not row.get("verified"):
-            return False, f"[chat] '{alias}' is not an accepted friend yet."
-        remote_username = row.get("remote_username") or alias
-        if remote_username in self._pending_chat_outgoing:
-            return False, f"[chat] request to {alias} already pending."
-        sess = db_get_session(self.storage, alias)
-        self._pending_chat_outgoing[remote_username] = alias
-        await self._send_control(remote_username, {"t": "chat_req"})
-        if sess:
-            return True, f"[chat] request sent to {alias}. Awaiting approval for new session..."
-        return True, f"[chat] request sent to {alias}. Awaiting approval..."
-
-    async def send_chat_request(self, alias: str) -> None:
-        _, message = await self._send_chat_request_common(alias)
-        print(message)
-
-    async def send_chat_request_feedback(self, alias: str) -> tuple[bool, str]:
-        return await self._send_chat_request_common(alias)
-
-    async def respond_chat_request(self, remote_username: str, accept: bool) -> None:
-        prompt = self._extract_prompt(lambda p: p.get("type") == "chat_confirm" and p.get("remote") == remote_username)
-        alias = self._alias_for_remote(remote_username) or remote_username
-        if accept:
-            self.active_contact = alias
-            await self._handle_chat_response_local(remote_username, True)
-            self._notify_event({
-                "type": "chat_started",
-                "remote": remote_username,
-                "alias": alias,
-            })
-        else:
-            await self._handle_chat_response_local(remote_username, False)
-            self._notify_event({
-                "type": "chat_declined",
-                "remote": remote_username,
-                "alias": alias,
-            })
-        if prompt:
-            await self._maybe_show_prompt()
 
     async def respond_friend_request(self, remote_username: str, accept: bool, alias: Optional[str] = None) -> None:
         prompt = self._extract_prompt(lambda p: p.get("type") == "friend_confirm" and p.get("remote") == remote_username)
@@ -1171,6 +1082,20 @@ class ClientRuntime:
     async def list_messages(self, alias: str, limit: int = 200) -> list[dict]:
         return self.storage.messages_list(alias, limit=limit, decrypt_bodies=True)[::-1]
 
+    async def open_chat(self, alias: str) -> None:
+        row = self.storage.contact_get(alias)
+        if not row:
+            print(f"[chat] unknown contact '{alias}'.")
+            return
+        remote_username = row.get("remote_username") or alias
+        self.active_contact = alias
+        sess = db_get_session(self.storage, alias)
+        if not sess and alias not in self._session_establishing:
+            self._session_establishing.add(alias)
+            await self.start_session_with(alias, remote_username)
+        if not sess:
+            print(f"[chat] establishing secure session with {alias}...")
+
     async def rekey_active(self) -> None:
         if not self.active_contact:
             print("[chat] no active chat to rekey.")
@@ -1184,7 +1109,7 @@ class ClientRuntime:
 
     async def handle_plain_message(self, text: str) -> None:
         if not self.active_contact:
-            print("[chat] no active chat. Use /chat <alias> to start one.")
+            print("[chat] no active chat. Use /chat <alias> to select one.")
             return
         await self.send_text(self.active_contact, text)
 
@@ -1203,7 +1128,7 @@ HELP = """
 Commands:
   /online                        List currently connected users
   /add <alias> @<user>           Send a friend request to <user>
-  /chat <alias>                  Request a secure chat with a friend
+  /chat <alias>                  Select a chat (auto-establish session)
   /remove <alias>                Remove a friend from your contacts
   /rekey                         Force a key rotation with the active chat
   /help                          Show this help
@@ -1293,7 +1218,7 @@ async def cli_main():
             continue
         if line.startswith("/chat "):
             _, alias = line.split(maxsplit=1)
-            await client.send_chat_request(alias.strip())
+            await client.open_chat(alias.strip())
             await prompt_render()
             continue
         if line.startswith("/remove "):
